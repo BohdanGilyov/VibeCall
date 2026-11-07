@@ -1,281 +1,589 @@
 
 (() => {
-    if (window.__snomChatBridge) return;
-    window.__snomChatBridge = true;
+    if (window.__snomBridge44) return;
+    window.__snomBridge44 = true;
 
-    let busy = false;
-
-    const pause = ms =>
+    const sleep = ms =>
         new Promise(resolve => setTimeout(resolve, ms));
 
-    const notify = (kind, jobId, message = "") =>
-        chrome.runtime.sendMessage({
-            type: "event",
-            kind,
-            jobId,
-            message
-        }).catch(() => {});
+    const send = data =>
+        chrome.runtime.sendMessage(data);
 
-    function visible(element) {
-        return !!element &&
-            element.getClientRects().length > 0;
+    const normalize = value =>
+        String(value || "")
+            .replace(/\u00a0/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+
+    let busy = false;
+    let polling = false;
+
+    const RESPONSE_COPY = [
+        '[data-testid="copy-turn-action-button"]',
+        '[data-test-id="copy-turn-action-button"]',
+        'button[aria-label="Copy response"]',
+        'button[aria-label="Copy message"]',
+        'button[aria-label="Копировать ответ"]'
+    ].join(",");
+
+    function visible(el) {
+        return !!el && el.getClientRects().length > 0;
+    }
+
+    function assistantMessages() {
+        const markers = [
+            '[data-message-author-role="assistant"]',
+            '[data-conversation-role="assistant"]',
+            '[data-turn="assistant"]',
+            '[data-role="assistant"]',
+            '[data-message-author="assistant"]',
+            '[data-turn-key]:has([data-chatgpt-agent-turn-start])'
+        ].join(",");
+
+        let nodes = [
+            ...new Set(document.querySelectorAll(markers))
+        ].filter(visible);
+
+        nodes = nodes.filter(node => {
+            const own = normalize(node.innerText);
+
+            if (!own) return false;
+
+            return !nodes.some(other =>
+                other !== node &&
+                node.contains(other) &&
+                normalize(other.innerText).length >= 2
+            );
+        });
+
+        if (nodes.length === 0) {
+            nodes = [
+                ...document.querySelectorAll(
+                    'main .markdown, main .prose, ' +
+                    '[data-app-shell-main-content-layout] .markdown, ' +
+                    '[data-app-shell-main-content-layout] .prose'
+                )
+            ].filter(el =>
+                visible(el) && normalize(el.innerText)
+            );
+
+            nodes = nodes.filter(node =>
+                !nodes.some(other =>
+                    other !== node &&
+                    node.contains(other)
+                )
+            );
+        }
+
+        return nodes
+            .map(el => normalize(el.innerText))
+            .filter(Boolean);
+    }
+
+    function copyCount() {
+        return [
+            ...document.querySelectorAll(RESPONSE_COPY)
+        ].filter(visible).length;
+    }
+
+    function stopVisible() {
+        const selectors = [
+            '[data-testid="stop-button"]',
+            '[data-test-id="stop-button"]',
+            'button[aria-label="Stop generating"]',
+            'button[aria-label="Stop streaming"]',
+            'button[aria-label="Stop response"]',
+            'button[aria-label="Остановить генерацию"]',
+            'button[aria-label="Остановить ответ"]'
+        ].join(",");
+
+        return [
+            ...document.querySelectorAll(selectors)
+        ].some(visible);
+    }
+
+    function textAfterPrompt(prompt) {
+        const root =
+            document.querySelector("main") ||
+            document.querySelector(
+                "[data-app-shell-main-content-layout]"
+            ) ||
+            document.body;
+
+        const page = normalize(root?.innerText);
+        const normalizedPrompt = normalize(prompt);
+
+        if (!page || !normalizedPrompt) return "";
+
+        const anchors = [
+            normalizedPrompt,
+            normalizedPrompt.slice(0, 90),
+            normalizedPrompt.slice(-70)
+        ].filter(part => part.length >= 12);
+
+        for (const anchor of anchors) {
+            const at = page.lastIndexOf(anchor);
+
+            if (at < 0) continue;
+
+            let after = page
+                .slice(at + anchor.length)
+                .trim();
+
+            const composerMarkers = [
+                "Спросить ChatGPT",
+                "Спросить что-нибудь",
+                "Ask anything",
+                "Ask ChatGPT",
+                "Message ChatGPT"
+            ];
+
+            for (const marker of composerMarkers) {
+                const i = after.lastIndexOf(marker);
+
+                if (i >= 0 && i > 5) {
+                    after = after.slice(0, i).trim();
+                }
+            }
+
+            return after;
+        }
+
+        return "";
     }
 
     function composer() {
         const selectors = [
-            "#prompt-textarea[contenteditable='true']",
-            "[data-testid='prompt-textarea'][contenteditable='true']",
-            "form [contenteditable='true']",
-            "textarea#prompt-textarea"
+            '#prompt-textarea[contenteditable="true"]',
+            '[data-testid="prompt-textarea"][contenteditable="true"]',
+            'form[data-chatgpt-composer] [data-composer-markdown][contenteditable="true"]',
+            'form [contenteditable="true"][role="textbox"]',
+            'textarea#prompt-textarea'
         ];
 
-        for (const selector of selectors) {
-            const element = [
-                ...document.querySelectorAll(selector)
-            ].find(visible);
-
-            if (element) return element;
-        }
-
-        return null;
+        return selectors
+            .map(selector =>
+                [
+                    ...document.querySelectorAll(selector)
+                ].find(visible)
+            )
+            .find(Boolean) || null;
     }
 
-    function sendButton() {
+    function submitButton() {
         const selectors = [
-            "[data-testid='send-button']",
-            "[data-testid='composer-submit-button']",
-            "button[aria-label='Send prompt']",
-            "button[aria-label='Send message']"
+            '[data-testid="send-button"]',
+            '[data-testid="composer-submit-button"]',
+            'button[aria-label="Send prompt"]',
+            'button[aria-label="Send message"]',
+            'button[aria-label="Отправить сообщение"]',
+            'form button[type="submit"]'
         ];
 
-        for (const selector of selectors) {
-            const button = [
-                ...document.querySelectorAll(selector)
-            ].find(visible);
+        return selectors
+            .map(selector =>
+                [
+                    ...document.querySelectorAll(selector)
+                ].find(el =>
+                    visible(el) &&
+                    !el.disabled &&
+                    !el.matches(
+                        '[data-testid="stop-button"]'
+                    )
+                )
+            )
+            .find(Boolean) || null;
+    }
 
-            if (button && !button.disabled) {
-                return button;
+    async function notify(kind, jobId, detail = "") {
+        const attempts =
+            kind === "done" || kind === "error"
+                ? 8
+                : 2;
+
+        for (let n = 0; n < attempts; n++) {
+            try {
+                const reply = await send({
+                    type: "event",
+                    kind,
+                    jobId,
+                    message: detail
+                });
+
+                if (reply?.ok === true) {
+                    return true;
+                }
+
+            } catch (_) {}
+
+            await sleep(400 + 200 * n);
+        }
+
+        return false;
+    }
+
+    async function monitor(job) {
+        const start = Number(job.submittedAt);
+        const deadline = start + 10 * 60 * 1000;
+
+        let lastObserved = "";
+        let changedAt = Date.now();
+        let noStopSince = 0;
+
+        let sawStop = false;
+        let sawAnswer = false;
+
+        let lastProgress = 0;
+        let lastSource = "";
+
+        while (Date.now() < deadline) {
+            await sleep(500);
+
+            const turns = assistantMessages();
+            const lastTurn = turns.at(-1) || "";
+
+            const turnIsNew =
+                !!lastTurn && (
+                    turns.length >
+                    Number(job.beforeCount || 0) ||
+                    lastTurn !== (job.beforeText || "")
+                );
+
+            const afterPrompt = textAfterPrompt(
+                job.prompt || ""
+            );
+
+            const stop = stopVisible();
+            const copies = copyCount();
+
+            const newCopy =
+                copies >
+                Number(job.beforeCopies || 0);
+
+            if (stop) {
+                sawStop = true;
+            }
+
+            let candidate = "";
+            let source = "";
+
+            if (turnIsNew) {
+                candidate = lastTurn;
+                source = "assistant";
+
+            } else if (
+                afterPrompt.length >= 15 &&
+                (
+                    newCopy ||
+                    sawStop ||
+                    Date.now() - start > 6500
+                )
+            ) {
+                candidate = afterPrompt;
+                source = "page";
+            }
+
+            if (candidate) {
+                sawAnswer = true;
+            }
+
+            if (candidate !== lastObserved) {
+                lastObserved = candidate;
+                changedAt = Date.now();
+            }
+
+            lastSource = source || lastSource;
+
+            if (stop) {
+                noStopSince = 0;
+
+            } else if (!noStopSince) {
+                noStopSince = Date.now();
+            }
+
+            if (Date.now() - lastProgress >= 3500) {
+                let status;
+
+                if (!sawAnswer) {
+                    status =
+                        "Ищу ответ (сообщений: " +
+                        turns.length +
+                        ", кнопок копирования: " +
+                        copies + ")";
+
+                } else if (stop) {
+                    status = "Ответ генерируется...";
+
+                } else {
+                    status =
+                        "Ответ найден (" +
+                        lastSource +
+                        "), проверяю завершение";
+                }
+
+                void notify(
+                    "progress",
+                    job.id,
+                    status
+                );
+
+                lastProgress = Date.now();
+            }
+
+            if (
+                !sawAnswer ||
+                !candidate ||
+                stop
+            ) {
+                continue;
+            }
+
+            if (Date.now() - start < 2500) {
+                continue;
+            }
+
+            const stable =
+                Date.now() - changedAt;
+
+            const noStop =
+                Date.now() - noStopSince;
+
+            const done =
+                (
+                    source === "assistant" &&
+                    newCopy &&
+                    stable >= 2200 &&
+                    noStop >= 1600
+                ) ||
+                (
+                    sawStop &&
+                    stable >= 3000 &&
+                    noStop >= 2000
+                ) ||
+                (
+                    stable >= 9000 &&
+                    noStop >= 9000 &&
+                    Date.now() - start >= 11000
+                );
+
+            if (done) {
+                const confirmed = await notify(
+                    "done",
+                    job.id
+                );
+
+                if (!confirmed) {
+                    throw new Error(
+                        "Java не подтвердила завершение ответа"
+                    );
+                }
+
+                await send({
+                    type: "forget"
+                });
+
+                return;
             }
         }
 
-        return [
-            ...document.querySelectorAll(
-                "form button[type='submit']"
-            )
-        ].find(button =>
-            visible(button) &&
-            !button.disabled &&
-            !button.matches(
-                "[data-testid='stop-button']"
-            )
+        throw new Error(
+            "Не удалось определить конец ответа за 10 минут"
         );
     }
 
-    function assistants() {
-        return [
-            ...document.querySelectorAll(
-                "[data-message-author-role='assistant']"
-            )
-        ];
-    }
+    async function submit(job) {
+        const field = composer();
 
-    function stopVisible() {
-        return [
-            ...document.querySelectorAll(
-                "[data-testid='stop-button'], " +
-                "button[aria-label='Stop generating'], " +
-                "button[aria-label='Stop streaming']"
-            )
-        ].some(visible);
-    }
-
-    async function perform(job) {
-        const input = composer();
-
-        if (!input) {
-            throw Error(
-                "Не найдено поле ввода ChatGPT"
+        if (!field) {
+            throw new Error(
+                "Поле ввода ChatGPT не найдено"
             );
         }
 
-        if (
-            (input.innerText || input.value || "").trim()
-        ) {
-            throw Error(
-                "В поле ChatGPT уже есть текст"
+        if (normalize(
+            field.innerText || field.value
+        )) {
+            throw new Error(
+                "В поле ChatGPT уже есть черновик"
             );
         }
 
-        const before = assistants().length;
+        const old = assistantMessages();
 
-        const previousText =
-            assistants().at(-1)?.innerText || "";
+        const state = {
+            schema: 44,
+            id: job.id,
+            prompt: job.text,
+            submittedAt: Date.now(),
+            beforeCount: old.length,
+            beforeText: old.at(-1) || "",
+            beforeCopies: copyCount()
+        };
 
-        input.focus();
+        field.focus();
 
-        let ok = false;
-
-        if (input.tagName === "TEXTAREA") {
+        if (field.tagName === "TEXTAREA") {
             const setter =
                 Object.getOwnPropertyDescriptor(
                     HTMLTextAreaElement.prototype,
                     "value"
-                ).set;
+                )?.set;
 
-            setter.call(input, job.text);
+            if (!setter) {
+                throw new Error(
+                    "Не найден setter поля ввода"
+                );
+            }
 
-            input.dispatchEvent(
-                new Event("input", { bubbles: true })
-            );
+            setter.call(field, job.text);
 
-            ok = input.value.includes(
-                job.text.slice(0, 20)
+            field.dispatchEvent(
+                new Event("input", {
+                    bubbles: true
+                })
             );
 
         } else {
-            ok = !!document.execCommand(
+            const worked = document.execCommand(
                 "insertText",
                 false,
                 job.text
             );
 
-            if (!ok) {
-                input.textContent = job.text;
+            if (!worked) {
+                field.textContent = job.text;
 
-                input.dispatchEvent(
+                field.dispatchEvent(
                     new InputEvent("input", {
                         bubbles: true,
                         inputType: "insertText",
                         data: job.text
                     })
                 );
-
-                ok = (input.innerText || "")
-                    .includes(job.text.slice(0, 20));
             }
         }
 
-        if (!ok) {
-            throw Error(
-                "Не удалось ввести текст в ChatGPT"
+        if (
+            !normalize(
+                field.innerText || field.value
+            ).includes(
+                normalize(job.text).slice(0, 12)
+            )
+        ) {
+            throw new Error(
+                "Не удалось вставить запрос"
             );
         }
 
-        let send = null;
+        let button = null;
 
-        for (let i = 0; i < 25 && !send; i++) {
-            send = sendButton();
+        for (
+            let i = 0;
+            i < 30 && !button;
+            i++
+        ) {
+            button = submitButton();
 
-            if (!send) {
-                await pause(200);
+            if (!button) {
+                await sleep(150);
             }
         }
 
-        if (!send) {
-            throw Error(
-                "Не найдена кнопка отправки"
+        if (!button) {
+            throw new Error(
+                "Кнопка отправки не найдена"
             );
         }
 
-        send.click();
+        await send({
+            type: "remember",
+            job: state
+        });
 
-        await notify("sent", job.id);
+        button.click();
 
-        const deadline = Date.now() + 600000;
+        void notify("sent", job.id);
 
-        let last = "";
-        let changedAt = Date.now();
-
-        let sawStop = false;
-        let sawNewReply = false;
-
-        while (Date.now() < deadline) {
-            await pause(650);
-
-            const messages = assistants();
-            const newest = messages.at(-1);
-
-            const text =
-                newest?.innerText?.trim() || "";
-
-            const stop = stopVisible();
-
-            if (stop) {
-                sawStop = true;
-            }
-
-            if (
-                (messages.length > before && text) ||
-                (
-                    messages.length === before &&
-                    text !== previousText &&
-                    text
-                )
-            ) {
-                sawNewReply = true;
-            }
-
-            if (!sawNewReply) continue;
-
-            if (text !== last) {
-                last = text;
-                changedAt = Date.now();
-            }
-
-            const stableMs =
-                Date.now() - changedAt;
-
-            const safeWindow = sawStop
-                ? 3000
-                : 9500;
-
-            if (
-                !stop &&
-                stableMs >= safeWindow &&
-                text.length > 0
-            ) {
-                await notify("done", job.id);
-                return;
-            }
-        }
-
-        throw Error(
-            "Ожидание ответа превысило 10 минут"
-        );
+        await monitor(state);
     }
 
-    async function tick() {
+    async function work(
+        job,
+        restoring = false
+    ) {
         if (busy) return;
 
+        busy = true;
+
         try {
-            const result =
-                await chrome.runtime.sendMessage({
-                    type: "poll"
-                });
+            if (restoring) {
+                await monitor(job);
+            } else {
+                await submit(job);
+            }
 
-            if (!result?.job) return;
+        } catch (error) {
+            await notify(
+                "error",
+                job.id,
+                String(error?.message || error)
+            );
 
-            busy = true;
+            await send({
+                type: "forget"
+            }).catch(() => {});
 
-            try {
-                await perform(result.job);
+        } finally {
+            busy = false;
+        }
+    }
 
-            } catch (error) {
-                await notify(
-                    "error",
-                    result.job.id,
-                    String(error.message || error)
-                );
+    async function poll() {
+        if (polling) return;
 
-            } finally {
-                busy = false;
+        polling = true;
+
+        try {
+            const result = await send({
+                type: "poll",
+                busy
+            });
+
+            if (result?.job && !busy) {
+                void work(result.job);
             }
 
         } catch (_) {
-            // Java пока не запущена
+        } finally {
+            polling = false;
         }
     }
 
-    setInterval(tick, 1300);
-    tick();
+    (async () => {
+        try {
+            const saved = await send({
+                type: "restore"
+            });
+
+            if (
+                saved?.job?.schema === 44 &&
+                Date.now() -
+                saved.job.submittedAt < 600000
+            ) {
+                void work(
+                    saved.job,
+                    true
+                );
+
+            } else if (saved?.job) {
+                await send({
+                    type: "forget"
+                });
+            }
+
+        } catch (_) {}
+
+        setInterval(poll, 1100);
+        poll();
+    })();
 })();

@@ -1,9 +1,10 @@
+
 {
   "manifest_version": 3,
   "name": "Snom ChatGPT Bridge",
-  "version": "1.0.0",
-  "description": "Связь локального Java-приложения Snom с выбранной вкладкой ChatGPT.",
-  "permissions": ["tabs"],
+  "version": "1.2.0",
+  "description": "Send Snom voice transcription to ChatGPT and signal when the answer is ready.",
+  "permissions": ["tabs", "storage"],
   "host_permissions": [
     "http://127.0.0.1:47624/*",
     "https://chatgpt.com/*",

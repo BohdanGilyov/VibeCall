@@ -1,63 +1,88 @@
-const BRIDGE = "http://127.0.0.1:47624";
 
-chrome.runtime.onMessage.addListener(
-    (message, sender, respond) => {
+const BRIDGE_URL = "http://127.0.0.1:47624";
 
-        if (!sender.tab ||
-            !["poll", "event"].includes(message.type)) {
-            return;
+chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+    const tab = sender.tab;
+
+    if (!tab || !tab.id) {
+        return false;
+    }
+
+    const key = `snom-active-${tab.id}`;
+
+    (async () => {
+        if (msg.type === "remember") {
+            await chrome.storage.session.set({
+                [key]: msg.job
+            });
+
+            return {ok: true};
         }
 
-        const tab = sender.tab;
+        if (msg.type === "restore") {
+            const data = await chrome.storage.session.get(key);
 
-        const path = message.type === "poll"
-            ? "/poll"
-            : "/event";
+            return {
+                job: data[key] || null
+            };
+        }
 
-        const payload = {
-            tabId: tab.id,
-            windowId: tab.windowId,
-            title: tab.title || "ChatGPT",
-            url: tab.url || "",
-            kind: message.kind,
-            jobId: message.jobId,
-            message: message.message
-        };
+        if (msg.type === "forget") {
+            await chrome.storage.session.remove(key);
 
-        (async () => {
-            const response = await fetch(BRIDGE + path, {
+            return {ok: true};
+        }
+
+        if (!["poll", "event"].includes(msg.type)) {
+            return {};
+        }
+
+        const response = await fetch(
+            BRIDGE_URL + (
+                msg.type === "poll" ? "/poll" : "/event"
+            ),
+            {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                     "X-Snom-Bridge": "chrome-ext-v1"
                 },
-                body: JSON.stringify(payload)
-            });
-
-            if (!response.ok) {
-                throw Error(
-                    "Local bridge HTTP " + response.status
-                );
+                body: JSON.stringify({
+                    tabId: tab.id,
+                    windowId: tab.windowId,
+                    title: tab.title || "ChatGPT",
+                    url: tab.url || "",
+                    busy: !!msg.busy,
+                    jobId: msg.jobId || -1,
+                    kind: msg.kind || "",
+                    message: msg.message || ""
+                })
             }
+        );
 
-            const data = await response.json();
+        if (!response.ok) {
+            throw new Error(
+                `Local bridge HTTP ${response.status}`
+            );
+        }
 
-            if (data.job) {
-                await chrome.windows.update(
-                    tab.windowId,
-                    { focused: true }
-                ).catch(() => {});
+        const data = await response.json();
 
-                await chrome.tabs.update(
-                    tab.id,
-                    { active: true }
-                ).catch(() => {});
-            }
+        if (data.job) {
+            await chrome.windows.update(
+                tab.windowId,
+                {focused: true}
+            ).catch(() => {});
 
-            respond(data);
+            await chrome.tabs.update(
+                tab.id,
+                {active: true}
+            ).catch(() => {});
+        }
 
-        })().catch(() => respond({}));
+        return data;
 
-        return true;
-    }
-);
+    })().then(respond).catch(() => respond({}));
+
+    return true;
+});
