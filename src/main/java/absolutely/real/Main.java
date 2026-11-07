@@ -16,8 +16,7 @@ import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.datatransfer.StringSelection;
-import java.io.IOException;
-import java.io.RandomAccessFile;
+import java.io.*;
 import java.net.*;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -30,6 +29,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.prefs.Preferences;
 
@@ -42,58 +42,92 @@ public class Main {
     private static final int MICROSIP_PORT = 47621;
     private static final int CHROME_PORT = 47624;
     private static final int WHISPER_PORT = 47630;
-
     private static final int SAMPLE_RATE = 16000;
 
-    private static final Path HISTORY = Path.of("transcripts");
+    private static final Path HISTORY =
+            Path.of("transcripts").toAbsolutePath().normalize();
+
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private static final DateTimeFormatter STAMP =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss_SSS");
+            DateTimeFormatter.ofPattern(
+                    "yyyy-MM-dd_HH-mm-ss_SSS"
+            );
 
     private static final DateTimeFormatter CLOCK =
             DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    private static final Color BG = new Color(11, 18, 31);
-    private static final Color CARD = new Color(23, 36, 55);
-    private static final Color SECOND = new Color(38, 56, 79);
-    private static final Color FG = new Color(243, 248, 255);
-    private static final Color MUTED = new Color(154, 173, 195);
-    private static final Color CYAN = new Color(81, 224, 197);
-    private static final Color BLUE = new Color(127, 182, 255);
+    private static final Color BG =
+            new Color(11, 18, 31);
+
+    private static final Color CARD =
+            new Color(23, 36, 55);
+
+    private static final Color SECOND =
+            new Color(38, 56, 79);
+
+    private static final Color FG =
+            new Color(243, 248, 255);
+
+    private static final Color MUTED =
+            new Color(154, 173, 195);
+
+    private static final Color CYAN =
+            new Color(81, 224, 197);
+
+    private static final Color BLUE =
+            new Color(127, 182, 255);
 
     private final JFrame frame =
-            new JFrame("Snom AI Bridge 5.0");
+            new JFrame("Snom AI Bridge 5.1");
 
     private final JLabel status =
             label("Готов · сними трубку", 18, true, FG);
 
     private final JLabel phoneInfo =
-            label("Snom: запускаю HTTP-сервер", 12, false, MUTED);
+            label(
+                    "Snom: запускаю HTTP-сервер",
+                    12, false, MUTED
+            );
 
     private final JLabel audioInfo =
             label("Vosk: загрузка", 12, false, MUTED);
 
     private final JLabel asrInfo =
-            label("Whisper: ожидает звонок", 12, false, MUTED);
+            label("Whisper: запуск...", 12, false, MUTED);
 
     private final JLabel chromeInfo =
-            label("Chrome: ожидаю расширение", 12, false, MUTED);
+            label(
+                    "Chrome: ожидаю расширение",
+                    12, false, MUTED
+            );
 
     private final JLabel preview =
-            label("Слова появятся здесь", 13, false, BLUE);
+            label(
+                    "Слова появятся здесь",
+                    13, false, BLUE
+            );
 
     private final JLabel timer =
             label("00:00", 30, true, FG);
 
-    private final JTextArea transcript = new JTextArea();
-    private final JProgressBar meter = new JProgressBar(0, 100);
-    private final JComboBox<Tab> target = new JComboBox<>();
+    private final JTextArea transcript =
+            new JTextArea();
+
+    private final JProgressBar meter =
+            new JProgressBar(0, 100);
+
+    private final JComboBox<Tab> target =
+            new JComboBox<>();
 
     private final JCheckBox autoSend =
-            new JCheckBox("Отправлять после распознавания", true);
+            new JCheckBox(
+                    "Отправлять после распознавания",
+                    true
+            );
 
-    private final GreenToggle enabledButton = new GreenToggle();
+    private final GreenToggle enabledButton =
+            new GreenToggle();
 
     private final Preferences prefs =
             Preferences.userNodeForPackage(Main.class);
@@ -102,10 +136,19 @@ public class Main {
             prefs.get("speaker", "");
 
     private volatile int volume =
-            Math.max(0, Math.min(100, prefs.getInt("volume", 70)));
+            Math.max(
+                    0,
+                    Math.min(
+                            100,
+                            prefs.getInt("volume", 70)
+                    )
+            );
 
     private volatile boolean useWhisper =
             prefs.getBoolean("useWhisper", true);
+
+    private volatile boolean saveLogs =
+            prefs.getBoolean("saveLogs", true);
 
     private volatile String snomUser = "";
     private volatile String snomPassword = "";
@@ -118,7 +161,9 @@ public class Main {
     private volatile long callStarted;
     private volatile long frozenDuration;
     private volatile String lastText = "";
+
     private volatile TargetDataLine inputLine;
+    private volatile Process whisperProcess;
 
     private final BlockingQueue<String> phoneEvents =
             new LinkedBlockingQueue<>();
@@ -126,8 +171,14 @@ public class Main {
     private final ConcurrentMap<Long, Tab> tabs =
             new ConcurrentHashMap<>();
 
-    private final AtomicLong ids = new AtomicLong(1);
-    private final AtomicLong generation = new AtomicLong();
+    private final AtomicLong ids =
+            new AtomicLong(1);
+
+    private final AtomicLong generation =
+            new AtomicLong();
+
+    private final AtomicInteger processing =
+            new AtomicInteger();
 
     private final ExecutorService speechWorker =
             Executors.newSingleThreadExecutor(
@@ -139,9 +190,10 @@ public class Main {
                     r -> daemon(r, "snom-dial")
             );
 
-    private final HttpClient http = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(2))
-            .build();
+    private final HttpClient http =
+            HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(2))
+                    .build();
 
     private volatile BrowserJob queuedJob;
 
@@ -152,7 +204,7 @@ public class Main {
 
     private boolean editingTabs;
 
-    private boolean active;
+    private volatile boolean active;
     private boolean finishing;
     private boolean testCall;
     private boolean sipConnected;
@@ -162,8 +214,10 @@ public class Main {
 
     private Path wavPath;
     private WaveWriter wav;
+    private boolean keepThisCall;
 
-    private final StringBuilder spoken = new StringBuilder();
+    private final StringBuilder spoken =
+            new StringBuilder();
 
     private HttpServer phoneServer;
     private HttpServer chromeServer;
@@ -205,13 +259,22 @@ public class Main {
     }
 
     public static void main(String[] args) {
-        SwingUtilities.invokeLater(() -> new Main().start());
+        SwingUtilities.invokeLater(
+                () -> new Main().start()
+        );
     }
 
-    private static Thread daemon(Runnable task, String name) {
+    private static Thread daemon(
+            Runnable task,
+            String name
+    ) {
         Thread t = new Thread(task, name);
         t.setDaemon(true);
         return t;
+    }
+
+    private static void ui(Runnable r) {
+        SwingUtilities.invokeLater(r);
     }
 
     private static JPanel clearPanel() {
@@ -221,12 +284,12 @@ public class Main {
     }
 
     private static JLabel label(
-            String s,
+            String value,
             int size,
             boolean bold,
             Color color
     ) {
-        JLabel l = new JLabel(s);
+        JLabel l = new JLabel(value);
 
         l.setFont(
                 new Font(
@@ -238,10 +301,6 @@ public class Main {
 
         l.setForeground(color);
         return l;
-    }
-
-    private static void ui(Runnable r) {
-        SwingUtilities.invokeLater(r);
     }
 
     private static class Card extends JPanel {
@@ -266,22 +325,15 @@ public class Main {
 
             x.setPaint(
                     new GradientPaint(
-                            0,
-                            0,
-                            a,
-                            getWidth(),
-                            getHeight(),
-                            b
+                            0, 0, a,
+                            getWidth(), getHeight(), b
                     )
             );
 
             x.fillRoundRect(
-                    0,
-                    0,
-                    getWidth(),
-                    getHeight(),
-                    20,
-                    20
+                    0, 0,
+                    getWidth(), getHeight(),
+                    20, 20
             );
 
             x.dispose();
@@ -295,14 +347,21 @@ public class Main {
             super("ON · Телефон активен");
 
             setSelected(true);
+            setOpaque(false);
             setContentAreaFilled(false);
             setBorderPainted(false);
             setFocusPainted(false);
 
-            setPreferredSize(new Dimension(215, 43));
+            setPreferredSize(
+                    new Dimension(215, 43)
+            );
 
             setFont(
-                    new Font("Segoe UI", Font.BOLD, 13)
+                    new Font(
+                            "Segoe UI",
+                            Font.BOLD,
+                            13
+                    )
             );
 
             setCursor(
@@ -321,54 +380,58 @@ public class Main {
                     RenderingHints.VALUE_ANTIALIAS_ON
             );
 
-            Color color = isSelected()
+            Color c = isSelected()
                     ? new Color(18, 158, 79)
                     : new Color(178, 45, 55);
 
             if (getModel().isPressed()) {
-                color = color.darker();
+                c = c.darker();
             }
 
-            x.setColor(color);
+            x.setColor(c);
 
             x.fillRoundRect(
-                    0,
-                    0,
-                    getWidth(),
-                    getHeight(),
-                    14,
-                    14
+                    0, 0,
+                    getWidth(), getHeight(),
+                    14, 14
             );
 
-            x.setFont(getFont());
             x.setColor(Color.WHITE);
+            x.setFont(getFont());
 
-            FontMetrics m = x.getFontMetrics();
+            FontMetrics fm = x.getFontMetrics();
 
             x.drawString(
                     getText(),
                     Math.max(
                             5,
                             (getWidth() -
-                                    m.stringWidth(getText())) / 2
+                                    fm.stringWidth(getText())) / 2
                     ),
-                    (getHeight() - m.getHeight()) / 2
-                            + m.getAscent()
+                    (getHeight() - fm.getHeight()) / 2
+                            + fm.getAscent()
             );
 
             x.dispose();
         }
     }
 
-    private JButton button(String s, Runnable action) {
-        JButton b = new JButton(s);
+    private JButton button(
+            String text,
+            Runnable action
+    ) {
+        JButton b = new JButton(text);
 
         b.setBackground(SECOND);
         b.setForeground(FG);
         b.setFocusPainted(false);
 
         b.setFont(
-                new Font("Segoe UI", Font.BOLD, 12)
+                new Font(
+                        "Segoe UI",
+                        Font.BOLD,
+                        12
+                )
         );
 
         b.setBorder(
@@ -376,7 +439,6 @@ public class Main {
         );
 
         b.addActionListener(e -> action.run());
-
         return b;
     }
 
@@ -386,7 +448,11 @@ public class Main {
         );
 
         frame.setSize(1050, 780);
-        frame.setMinimumSize(new Dimension(820, 620));
+
+        frame.setMinimumSize(
+                new Dimension(820, 620)
+        );
+
         frame.setLocationRelativeTo(null);
 
         frame.getContentPane().setBackground(BG);
@@ -406,15 +472,16 @@ public class Main {
         JPanel titleBox = clearPanel();
 
         titleBox.setLayout(
-                new BoxLayout(titleBox, BoxLayout.Y_AXIS)
+                new BoxLayout(
+                        titleBox,
+                        BoxLayout.Y_AXIS
+                )
         );
 
         titleBox.add(
                 label(
-                        "S N O M   /   A I   B R I D G E   5.0",
-                        12,
-                        true,
-                        CYAN
+                        "S N O M   /   A I   B R I D G E   5.1",
+                        12, true, CYAN
                 )
         );
 
@@ -423,9 +490,7 @@ public class Main {
         titleBox.add(
                 label(
                         "Голос в ChatGPT",
-                        26,
-                        true,
-                        FG
+                        26, true, FG
                 )
         );
 
@@ -434,9 +499,7 @@ public class Main {
         titleBox.add(
                 label(
                         "Подними трубку → говори → положи → Whisper → ChatGPT",
-                        13,
-                        false,
-                        FG
+                        13, false, FG
                 )
         );
 
@@ -448,8 +511,13 @@ public class Main {
                 new BoxLayout(right, BoxLayout.Y_AXIS)
         );
 
-        timer.setAlignmentX(Component.RIGHT_ALIGNMENT);
-        status.setAlignmentX(Component.RIGHT_ALIGNMENT);
+        timer.setAlignmentX(
+                Component.RIGHT_ALIGNMENT
+        );
+
+        status.setAlignmentX(
+                Component.RIGHT_ALIGNMENT
+        );
 
         right.add(timer);
         right.add(Box.createVerticalStrut(7));
@@ -474,11 +542,15 @@ public class Main {
                 new EmptyBorder(0, 20, 0, 20)
         );
 
-        body.setLayout(new BorderLayout(0, 12));
+        body.setLayout(
+                new BorderLayout(0, 12)
+        );
 
         Card info = new Card(CARD, CARD);
 
-        info.setLayout(new GridLayout(4, 1, 0, 6));
+        info.setLayout(
+                new GridLayout(4, 1, 0, 6)
+        );
 
         info.setBorder(
                 new EmptyBorder(12, 16, 12, 16)
@@ -493,7 +565,9 @@ public class Main {
 
         Card writing = new Card(CARD, CARD);
 
-        writing.setLayout(new BorderLayout(0, 8));
+        writing.setLayout(
+                new BorderLayout(0, 8)
+        );
 
         writing.setBorder(
                 new EmptyBorder(14, 17, 13, 17)
@@ -502,15 +576,17 @@ public class Main {
         writing.add(
                 label(
                         "РАСПОЗНАННАЯ РЕЧЬ",
-                        13,
-                        true,
-                        CYAN
+                        13, true, CYAN
                 ),
                 BorderLayout.NORTH
         );
 
         transcript.setFont(
-                new Font("Segoe UI", Font.PLAIN, 16)
+                new Font(
+                        "Segoe UI",
+                        Font.PLAIN,
+                        16
+                )
         );
 
         transcript.setLineWrap(true);
@@ -525,32 +601,57 @@ public class Main {
                 "Готов к диктовке. Сними трубку Snom 320.\n"
         );
 
-        JScrollPane scroll = new JScrollPane(transcript);
+        JScrollPane scroll =
+                new JScrollPane(transcript);
 
         scroll.setBorder(null);
         scroll.getViewport().setBackground(CARD);
 
-        writing.add(scroll, BorderLayout.CENTER);
+        writing.add(
+                scroll,
+                BorderLayout.CENTER
+        );
 
         JPanel bottomText = clearPanel();
 
-        bottomText.setLayout(new BorderLayout(0, 6));
+        bottomText.setLayout(
+                new BorderLayout(0, 6)
+        );
 
         meter.setForeground(CYAN);
         meter.setBackground(SECOND);
         meter.setBorderPainted(false);
 
-        bottomText.add(preview, BorderLayout.NORTH);
-        bottomText.add(meter, BorderLayout.SOUTH);
+        bottomText.add(
+                preview,
+                BorderLayout.NORTH
+        );
 
-        writing.add(bottomText, BorderLayout.SOUTH);
+        bottomText.add(
+                meter,
+                BorderLayout.SOUTH
+        );
 
-        body.add(writing, BorderLayout.CENTER);
-        frame.add(body, BorderLayout.CENTER);
+        writing.add(
+                bottomText,
+                BorderLayout.SOUTH
+        );
+
+        body.add(
+                writing,
+                BorderLayout.CENTER
+        );
+
+        frame.add(
+                body,
+                BorderLayout.CENTER
+        );
 
         Card controls = new Card(CARD, CARD);
 
-        controls.setLayout(new BorderLayout(0, 12));
+        controls.setLayout(
+                new BorderLayout(0, 12)
+        );
 
         controls.setBorder(
                 new EmptyBorder(13, 16, 13, 16)
@@ -558,106 +659,142 @@ public class Main {
 
         JPanel select = clearPanel();
 
-        select.setLayout(new BorderLayout(12, 0));
+        select.setLayout(
+                new BorderLayout(12, 0)
+        );
 
         select.add(
                 label(
                         "ВКЛАДКА CHATGPT",
-                        12,
-                        true,
-                        MUTED
+                        12, true, MUTED
                 ),
                 BorderLayout.WEST
         );
 
         target.setFont(
-                new Font("Segoe UI", Font.PLAIN, 13)
+                new Font(
+                        "Segoe UI",
+                        Font.PLAIN,
+                        13
+                )
         );
 
         target.addActionListener(e -> {
             if (!editingTabs) {
-                Tab current =
+                Tab t =
                         (Tab) target.getSelectedItem();
 
-                selectedTab = current == null
+                selectedTab = t == null
                         ? -1
-                        : current.id();
+                        : t.id();
             }
         });
 
-        select.add(target, BorderLayout.CENTER);
+        select.add(
+                target,
+                BorderLayout.CENTER
+        );
 
-        controls.add(select, BorderLayout.NORTH);
+        controls.add(
+                select,
+                BorderLayout.NORTH
+        );
 
         JPanel actions = clearPanel();
 
         actions.setLayout(
-                new FlowLayout(FlowLayout.LEFT, 7, 0)
+                new FlowLayout(
+                        FlowLayout.LEFT,
+                        7, 0
+                )
         );
 
-        actions.add(button(
-                "Тест записи",
-                () -> phoneEvents.offer("test")
-        ));
-
-        actions.add(button(
-                "Закончить",
-                () -> phoneEvents.offer("hangup")
-        ));
-
-        actions.add(button(
-                "Отправить ещё раз",
-                () -> queueBrowserJob(lastText)
-        ));
-
-        actions.add(button(
-                "Тест ChatGPT",
-                () -> queueBrowserJob(
-                        "Проверка связи. Ответь одним предложением."
+        actions.add(
+                button(
+                        "Тест записи",
+                        () -> phoneEvents.offer("test")
                 )
-        ));
+        );
 
-        actions.add(button(
-                "Сброс ожидания",
-                this::resetPending
-        ));
+        actions.add(
+                button(
+                        "Закончить",
+                        () -> phoneEvents.offer("hangup")
+                )
+        );
 
-        actions.add(button(
-                "Настройки",
-                this::openSettings
-        ));
+        actions.add(
+                button(
+                        "Отправить ещё раз",
+                        () -> queueBrowserJob(lastText)
+                )
+        );
 
-        controls.add(actions, BorderLayout.CENTER);
+        actions.add(
+                button(
+                        "Тест ChatGPT",
+                        () -> queueBrowserJob(
+                                "Проверка связи. Ответь одним предложением."
+                        )
+                )
+        );
+
+        actions.add(
+                button(
+                        "Сброс ожидания",
+                        this::resetPending
+                )
+        );
+
+        actions.add(
+                button(
+                        "Настройки",
+                        this::openSettings
+                )
+        );
+
+        controls.add(
+                actions,
+                BorderLayout.CENTER
+        );
 
         JPanel toggles = clearPanel();
 
         toggles.setLayout(
-                new FlowLayout(FlowLayout.LEFT, 13, 0)
+                new FlowLayout(
+                        FlowLayout.LEFT,
+                        13, 0
+                )
         );
 
         autoSend.setForeground(FG);
         autoSend.setOpaque(false);
 
-        autoSend.addActionListener(e ->
-                autoSubmit = autoSend.isSelected()
+        autoSend.addActionListener(
+                e -> autoSubmit = autoSend.isSelected()
         );
 
         toggles.add(autoSend);
 
-        enabledButton.addActionListener(e ->
-                setEnabled(enabledButton.isSelected())
+        enabledButton.addActionListener(
+                e -> setEnabled(
+                        enabledButton.isSelected()
+                )
         );
 
         toggles.add(enabledButton);
 
-        toggles.add(label(
-                "ON при запуске",
-                11,
-                false,
-                MUTED
-        ));
+        toggles.add(
+                label(
+                        "ON при запуске",
+                        11, false, MUTED
+                )
+        );
 
-        controls.add(toggles, BorderLayout.SOUTH);
+        controls.add(
+                toggles,
+                BorderLayout.SOUTH
+        );
 
         JPanel south = clearPanel();
 
@@ -669,7 +806,10 @@ public class Main {
 
         south.add(controls);
 
-        frame.add(south, BorderLayout.SOUTH);
+        frame.add(
+                south,
+                BorderLayout.SOUTH
+        );
 
         frame.addWindowListener(
                 new java.awt.event.WindowAdapter() {
@@ -682,39 +822,42 @@ public class Main {
                 }
         );
 
-        uiTimer = new javax.swing.Timer(400, e -> {
-            long nanos = recording
-                    ? System.nanoTime() - callStarted
-                    : frozenDuration;
+        uiTimer = new javax.swing.Timer(
+                400,
+                e -> {
+                    long nanos = recording
+                            ? System.nanoTime() - callStarted
+                            : frozenDuration;
 
-            long sec = Math.max(
-                    0,
-                    nanos / 1_000_000_000L
-            );
+                    long seconds = Math.max(
+                            0,
+                            nanos / 1_000_000_000L
+                    );
 
-            timer.setText(
-                    String.format(
-                            Locale.ROOT,
-                            "%02d:%02d",
-                            sec / 60,
-                            sec % 60
-                    )
-            );
+                    timer.setText(
+                            String.format(
+                                    Locale.ROOT,
+                                    "%02d:%02d",
+                                    seconds / 60,
+                                    seconds % 60
+                            )
+                    );
 
-            refreshTabs();
+                    refreshTabs();
 
-            if (
-                    pendingId != -1 &&
-                            System.currentTimeMillis() -
-                                    pendingSince > 630000
-            ) {
-                resetPending();
+                    if (
+                            pendingId != -1 &&
+                                    System.currentTimeMillis()
+                                            - pendingSince > 630000
+                    ) {
+                        resetPending();
 
-                chromeInfo.setText(
-                        "ChatGPT: превышено время ожидания ответа"
-                );
-            }
-        });
+                        chromeInfo.setText(
+                                "ChatGPT: превышено время ожидания ответа"
+                        );
+                    }
+                }
+        );
 
         uiTimer.start();
         frame.setVisible(true);
@@ -723,17 +866,29 @@ public class Main {
         startSipServer();
         startChromeServer();
 
+        Runtime.getRuntime().addShutdownHook(
+                new Thread(
+                        this::stopWhisperAutomatically,
+                        "whisper-shutdown"
+                )
+        );
+
+        daemon(
+                this::startWhisperAutomatically,
+                "whisper-startup"
+        ).start();
+
         daemon(
                 this::capture,
                 "vosk-capture"
         ).start();
     }
 
-    private void setEnabled(boolean value) {
-        enabled = value;
+    private void setEnabled(boolean on) {
+        enabled = on;
 
         enabledButton.setText(
-                value
+                on
                         ? "ON · Телефон активен"
                         : "OFF · Телефон отключён"
         );
@@ -741,14 +896,14 @@ public class Main {
         enabledButton.repaint();
 
         status.setText(
-                value
+                on
                         ? "Готов · сними трубку"
                         : "Отключён · OFF"
         );
 
         phoneEvents.clear();
 
-        if (!value) {
+        if (!on) {
             generation.incrementAndGet();
 
             phoneEvents.offer("cancel");
@@ -765,7 +920,9 @@ public class Main {
 
         List<Tab> list = tabs.values()
                 .stream()
-                .filter(t -> now - t.updated() < 15000)
+                .filter(
+                        t -> now - t.updated() < 15000
+                )
                 .sorted(
                         Comparator.comparing(Tab::title)
                                 .thenComparingLong(Tab::id)
@@ -797,7 +954,6 @@ public class Main {
 
         long old = selectedTab;
         editingTabs = true;
-
         target.removeAllItems();
 
         int index = -1;
@@ -822,14 +978,21 @@ public class Main {
 
         editingTabs = false;
 
-        if (list.isEmpty() && pendingId == -1) {
+        if (
+                list.isEmpty() &&
+                        pendingId == -1
+        ) {
             chromeInfo.setText(
                     "Chrome: открой ChatGPT и обнови F5"
             );
 
-        } else if (!list.isEmpty() && pendingId == -1) {
+        } else if (
+                !list.isEmpty() &&
+                        pendingId == -1
+        ) {
             chromeInfo.setText(
-                    "Chrome: подключено вкладок " + list.size()
+                    "Chrome: подключено вкладок " +
+                            list.size()
             );
         }
     }
@@ -837,19 +1000,22 @@ public class Main {
     private void startPhoneServer() {
         try {
             phoneServer = HttpServer.create(
-                    new InetSocketAddress(PC, PHONE_PORT),
+                    new InetSocketAddress(
+                            PC,
+                            PHONE_PORT
+                    ),
                     0
             );
 
             phoneServer.createContext("/", x -> {
-                String remote = x.getRemoteAddress()
-                        .getAddress()
-                        .getHostAddress();
+                String remote =
+                        x.getRemoteAddress()
+                                .getAddress()
+                                .getHostAddress();
 
-                String path =
-                        x.getRequestURI().getPath();
-
-                String ev = switch (path) {
+                String ev = switch (
+                        x.getRequestURI().getPath()
+                        ) {
                     case "/offhook" -> "offhook";
 
                     case "/connected", "/outgoing" ->
@@ -870,14 +1036,21 @@ public class Main {
                                 ? 403
                                 : ev.isEmpty() ? 404 : 200;
 
-                byte[] body = (
-                        code == 200 ? "OK" : "Not found"
+                byte[] b = (
+                        code == 200
+                                ? "OK"
+                                : "Not found"
                 ).getBytes(StandardCharsets.UTF_8);
 
-                x.sendResponseHeaders(code, body.length);
+                x.sendResponseHeaders(
+                        code,
+                        b.length
+                );
 
-                try (var out = x.getResponseBody()) {
-                    out.write(body);
+                try (
+                        var out = x.getResponseBody()
+                ) {
+                    out.write(b);
                 }
 
                 if (code == 200 && enabled) {
@@ -887,7 +1060,10 @@ public class Main {
 
             phoneServer.setExecutor(
                     Executors.newCachedThreadPool(
-                            r -> daemon(r, "snom-http")
+                            r -> daemon(
+                                    r,
+                                    "snom-http"
+                            )
                     )
             );
 
@@ -895,12 +1071,14 @@ public class Main {
 
             phoneInfo.setText(
                     "Snom HTTP: " +
-                            PC + ":" + PHONE_PORT + " готов"
+                            PC + ":" +
+                            PHONE_PORT + " готов"
             );
 
         } catch (IOException ex) {
             phoneInfo.setText(
-                    "Snom: ошибка HTTP: " + ex.getMessage()
+                    "Snom: ошибка HTTP: " +
+                            ex.getMessage()
             );
         }
     }
@@ -936,17 +1114,24 @@ public class Main {
                                 .trim()
                                 .toLowerCase(Locale.ROOT);
 
-                        if (enabled && ev.equals("connected")) {
+                        if (
+                                enabled &&
+                                        ev.equals("connected")
+                        ) {
                             phoneEvents.offer("connected");
                         }
 
-                        if (enabled && ev.equals("ended")) {
+                        if (
+                                enabled &&
+                                        ev.equals("ended")
+                        ) {
                             phoneEvents.offer("hangup");
                         }
 
                     } catch (Exception ignored) {
                     }
                 }
+
             }, "sip-events").start();
 
         } catch (SocketException ex) {
@@ -973,10 +1158,13 @@ public class Main {
                 }
 
                 try {
-                    JsonNode data =
-                            JSON.readTree(x.getRequestBody());
+                    JsonNode data = JSON.readTree(
+                            x.getRequestBody()
+                    );
 
-                    long tab = data.path("tabId").asLong(-1);
+                    long tab =
+                            data.path("tabId").asLong(-1);
+
                     long window =
                             data.path("windowId").asLong(-1);
 
@@ -986,8 +1174,12 @@ public class Main {
                     if (
                             tab < 0 ||
                                     !(
-                                            url.startsWith("https://chatgpt.com/") ||
-                                                    url.startsWith("https://chat.openai.com/")
+                                            url.startsWith(
+                                                    "https://chatgpt.com/"
+                                            ) ||
+                                                    url.startsWith(
+                                                            "https://chat.openai.com/"
+                                                    )
                                     )
                     ) {
                         respond(
@@ -995,6 +1187,7 @@ public class Main {
                                 400,
                                 JSON.createObjectNode()
                         );
+
                         return;
                     }
 
@@ -1018,14 +1211,17 @@ public class Main {
                             enabled &&
                                     job != null &&
                                     job.tabId() == tab &&
-                                    !data.path("busy").asBoolean(false)
+                                    !data.path("busy")
+                                            .asBoolean(false)
                     ) {
                         synchronized (this) {
                             if (queuedJob == job) {
                                 queuedJob = null;
 
                                 ObjectNode j =
-                                        response.putObject("job");
+                                        response.putObject(
+                                                "job"
+                                        );
 
                                 j.put("id", job.id());
                                 j.put("text", job.text());
@@ -1046,16 +1242,20 @@ public class Main {
                 }
 
                 try {
-                    JsonNode d =
-                            JSON.readTree(x.getRequestBody());
+                    JsonNode d = JSON.readTree(
+                            x.getRequestBody()
+                    );
 
-                    long id = d.path("jobId").asLong(-1);
-                    long tab = d.path("tabId").asLong(-1);
+                    long id =
+                            d.path("jobId").asLong(-1);
+
+                    long tab =
+                            d.path("tabId").asLong(-1);
 
                     String kind =
                             d.path("kind").asText("");
 
-                    String message =
+                    String detail =
                             d.path("message").asText("");
 
                     if (
@@ -1080,12 +1280,12 @@ public class Main {
 
                                 case "progress" ->
                                         chromeInfo.setText(
-                                                "ChatGPT: " + message
+                                                "ChatGPT: " + detail
                                         );
 
                                 case "error" ->
                                         chromeInfo.setText(
-                                                "Chrome: ошибка: " + message
+                                                "Chrome: ошибка: " + detail
                                         );
 
                                 case "done" -> {
@@ -1113,7 +1313,10 @@ public class Main {
 
             chromeServer.setExecutor(
                     Executors.newCachedThreadPool(
-                            r -> daemon(r, "chrome-http")
+                            r -> daemon(
+                                    r,
+                                    "chrome-http"
+                            )
                     )
             );
 
@@ -1121,7 +1324,8 @@ public class Main {
 
         } catch (IOException ex) {
             chromeInfo.setText(
-                    "Chrome: порт занят: " + ex.getMessage()
+                    "Chrome: порт занят: " +
+                            ex.getMessage()
             );
         }
     }
@@ -1161,14 +1365,21 @@ public class Main {
                 "application/json; charset=utf-8"
         );
 
-        x.sendResponseHeaders(code, bytes.length);
+        x.sendResponseHeaders(
+                code,
+                bytes.length
+        );
 
-        try (var out = x.getResponseBody()) {
+        try (
+                var out = x.getResponseBody()
+        ) {
             out.write(bytes);
         }
     }
 
-    private static void safeError(HttpExchange x) {
+    private static void safeError(
+            HttpExchange x
+    ) {
         try {
             respond(
                     x,
@@ -1195,7 +1406,10 @@ public class Main {
             return;
         }
 
-        if (text == null || text.isBlank()) {
+        if (
+                text == null ||
+                        text.isBlank()
+        ) {
             chromeInfo.setText(
                     "Нет текста для отправки"
             );
@@ -1222,6 +1436,7 @@ public class Main {
         );
 
         queuedJob = job;
+
         pendingId = job.id();
         pendingTab = tab.id();
         pendingSince = System.currentTimeMillis();
@@ -1238,7 +1453,7 @@ public class Main {
         pendingSince = 0;
 
         chromeInfo.setText(
-                "Ожидание Java сброшено (уже отправленный запрос не отменён)"
+                "Ожидание Java сброшено (отправленное не отменено)"
         );
     }
 
@@ -1256,41 +1471,55 @@ public class Main {
                     return;
                 }
 
-                HttpClient client = HttpClient.newBuilder()
-                        .connectTimeout(Duration.ofSeconds(3))
-                        .authenticator(new Authenticator() {
-                            @Override
-                            protected PasswordAuthentication
-                            getPasswordAuthentication() {
-                                return new PasswordAuthentication(
-                                        username,
-                                        password.toCharArray()
+                HttpClient.Builder clientBuilder =
+                        HttpClient.newBuilder()
+                                .connectTimeout(
+                                        Duration.ofSeconds(3)
                                 );
+
+                if (!username.isBlank()) {
+                    clientBuilder.authenticator(
+                            new Authenticator() {
+                                @Override
+                                protected PasswordAuthentication
+                                getPasswordAuthentication() {
+                                    return new PasswordAuthentication(
+                                            username,
+                                            password.toCharArray()
+                                    );
+                                }
                             }
-                        })
-                        .build();
+                    );
+                }
 
                 URI uri = URI.create(
                         "http://" + SNOM +
                                 "/index.htm?number=101&outgoing_uri=100%40192.168.50.1"
                 );
 
-                HttpRequest req = HttpRequest.newBuilder(uri)
-                        .timeout(Duration.ofSeconds(5))
-                        .GET()
-                        .build();
+                HttpRequest req =
+                        HttpRequest.newBuilder(uri)
+                                .timeout(
+                                        Duration.ofSeconds(5)
+                                )
+                                .GET()
+                                .build();
 
-                HttpResponse<Void> response = client.send(
-                        req,
-                        HttpResponse.BodyHandlers.discarding()
-                );
+                int code = clientBuilder
+                        .build()
+                        .send(
+                                req,
+                                HttpResponse.BodyHandlers
+                                        .discarding()
+                        )
+                        .statusCode();
 
                 ui(() -> phoneInfo.setText(
-                        response.statusCode() < 400
+                        code < 400
                                 ? "Snom: команда набора 101 отправлена"
                                 : "Snom HTTP: " +
-                                response.statusCode() +
-                                " · проверь логин/пароль в настройках"
+                                code +
+                                " · проверь логин/пароль"
                 ));
 
             } catch (Exception ex) {
@@ -1303,7 +1532,11 @@ public class Main {
     }
 
     private void capture() {
-        if (!Files.isDirectory(Path.of("model/am"))) {
+        if (
+                !Files.isDirectory(
+                        Path.of("model/am")
+                )
+        ) {
             ui(() -> audioInfo.setText(
                     "Нет модели Vosk в папке model"
             ));
@@ -1311,16 +1544,24 @@ public class Main {
         }
 
         try {
-            LibVosk.setLogLevel(LogLevel.WARNINGS);
+            LibVosk.setLogLevel(
+                    LogLevel.WARNINGS
+            );
 
             try (
                     Model model = new Model("model");
+
                     Recognizer recognizer =
-                            new Recognizer(model, SAMPLE_RATE)
+                            new Recognizer(
+                                    model,
+                                    SAMPLE_RATE
+                            )
             ) {
                 Capture source = findCable();
 
-                TargetDataLine line = source.line();
+                TargetDataLine line =
+                        source.line();
+
                 inputLine = line;
                 line.start();
 
@@ -1337,8 +1578,10 @@ public class Main {
 
                 ui(() -> audioInfo.setText(
                         "Vosk готов · " +
-                                source.name() + " · " +
-                                (int) source.format().getSampleRate() +
+                                source.name() +
+                                " · " +
+                                (int) source.format()
+                                        .getSampleRate() +
                                 " Гц"
                 ));
 
@@ -1382,7 +1625,9 @@ public class Main {
                                             ev.equals("test")
                                     );
 
-                                    if (ev.equals("offhook")) {
+                                    if (
+                                            ev.equals("offhook")
+                                    ) {
                                         dial101();
                                     }
 
@@ -1430,14 +1675,14 @@ public class Main {
                             recognizer.reset();
                         }
 
-                        int available = Math.min(
+                        int n = Math.min(
                                 line.available(),
                                 input.length
                         );
 
-                        available -= available % frameSize;
+                        n -= n % frameSize;
 
-                        if (available < frameSize) {
+                        if (n < frameSize) {
                             Thread.sleep(15);
                             continue;
                         }
@@ -1445,10 +1690,13 @@ public class Main {
                         int got = line.read(
                                 input,
                                 0,
-                                available
+                                n
                         );
 
-                        if (got <= 0 || !active) {
+                        if (
+                                got <= 0 ||
+                                        !active
+                        ) {
                             continue;
                         }
 
@@ -1463,7 +1711,11 @@ public class Main {
                         }
 
                         if (wav != null) {
-                            wav.write(pcm, 0, bytes);
+                            wav.write(
+                                    pcm,
+                                    0,
+                                    bytes
+                            );
                         }
 
                         if (
@@ -1481,20 +1733,22 @@ public class Main {
                             ));
 
                         } else {
-                            String partial = field(
+                            String phrase = field(
                                     recognizer.getPartialResult(),
                                     "partial"
                             );
 
                             ui(() -> preview.setText(
-                                    partial.isBlank()
+                                    phrase.isBlank()
                                             ? "Слушаю..."
-                                            : "Слышу: " + partial
+                                            : "Слышу: " + phrase
                             ));
                         }
 
-                        final int level =
-                                audioLevel(pcm, bytes);
+                        int level = audioLevel(
+                                pcm,
+                                bytes
+                        );
 
                         ui(() -> meter.setValue(level));
                     }
@@ -1510,6 +1764,26 @@ public class Main {
                         "Ошибка Vosk/VB-CABLE: " +
                                 ex.getMessage()
                 ));
+            }
+
+        } finally {
+            if (wav != null) {
+                try {
+                    wav.close();
+                } catch (IOException ignored) {
+                }
+
+                wav = null;
+            }
+
+            if (
+                    !keepThisCall &&
+                            wavPath != null
+            ) {
+                try {
+                    Files.deleteIfExists(wavPath);
+                } catch (IOException ignored) {
+                }
             }
         }
     }
@@ -1528,8 +1802,8 @@ public class Main {
         finishing = false;
         testCall = test;
         sipConnected = false;
-
         recording = true;
+
         callStarted = System.nanoTime();
         frozenDuration = 0;
 
@@ -1539,19 +1813,33 @@ public class Main {
         rec.reset();
         line.flush();
 
-        String name =
-                STAMP.format(LocalDateTime.now());
-
-        wavPath = HISTORY.resolve(name + ".wav");
+        keepThisCall = saveLogs;
 
         try {
+            if (keepThisCall) {
+                Files.createDirectories(HISTORY);
+
+                wavPath = HISTORY.resolve(
+                        STAMP.format(
+                                LocalDateTime.now()
+                        ) + ".wav"
+                );
+
+            } else {
+                wavPath = Files.createTempFile(
+                        "snom_bridge_",
+                        ".wav"
+                );
+            }
+
             wav = new WaveWriter(wavPath);
 
         } catch (IOException ex) {
             wav = null;
+            wavPath = null;
 
             ui(() -> asrInfo.setText(
-                    "Не удаётся записать WAV: " +
+                    "Не удалось создать WAV: " +
                             ex.getMessage()
             ));
         }
@@ -1570,7 +1858,7 @@ public class Main {
 
             asrInfo.setText(
                     useWhisper
-                            ? "Whisper: запишу весь звонок для уточнения"
+                            ? "Whisper: запишу звонок для уточнения"
                             : "Vosk: основной режим"
             );
         });
@@ -1595,12 +1883,23 @@ public class Main {
         if (wav != null) {
             try {
                 wav.close();
-
             } catch (IOException ignored) {
             }
         }
 
         wav = null;
+
+        if (
+                !keepThisCall &&
+                        wavPath != null
+        ) {
+            try {
+                Files.deleteIfExists(wavPath);
+            } catch (IOException ignored) {
+            }
+        }
+
+        wavPath = null;
 
         ui(() -> {
             meter.setValue(0);
@@ -1610,9 +1909,9 @@ public class Main {
     }
 
     private void appendVosk(String json) {
-        String text = field(json, "text");
+        String phrase = field(json, "text");
 
-        if (text.isBlank()) {
+        if (phrase.isBlank()) {
             return;
         }
 
@@ -1620,14 +1919,16 @@ public class Main {
             spoken.append(' ');
         }
 
-        spoken.append(text);
+        spoken.append(phrase);
 
         String line =
                 CLOCK.format(LocalDateTime.now()) +
-                        " | " + text;
+                        " | " + phrase;
 
         ui(() -> {
-            transcript.append(line + "\n\n");
+            transcript.append(
+                    line + "\n\n"
+            );
 
             transcript.setCaretPosition(
                     transcript.getDocument().getLength()
@@ -1636,7 +1937,9 @@ public class Main {
     }
 
     private void finishCall(Recognizer rec) {
-        appendVosk(rec.getFinalResult());
+        appendVosk(
+                rec.getFinalResult()
+        );
 
         active = false;
         finishing = false;
@@ -1644,28 +1947,35 @@ public class Main {
 
         lastStopAt = System.nanoTime();
 
-        String draft = spoken.toString().trim();
+        String draft =
+                spoken.toString().trim();
 
-        Path finalWav = wavPath;
-        long length = 0;
+        Path recordPath = wavPath;
+        boolean retain = keepThisCall;
+
+        long bytes = 0;
 
         if (wav != null) {
-            length = wav.length();
+            bytes = wav.length();
 
             try {
                 wav.close();
-
             } catch (IOException ignored) {
             }
-
-            wav = null;
         }
+
+        wav = null;
+        wavPath = null;
 
         boolean wasTest = testCall;
         long token = generation.get();
 
-        boolean wantWhisper =
-                useWhisper && length >= 6400;
+        boolean runWhisper =
+                useWhisper &&
+                        bytes >= 6400 &&
+                        recordPath != null;
+
+        processing.incrementAndGet();
 
         ui(() -> {
             status.setText(
@@ -1676,7 +1986,7 @@ public class Main {
             preview.setText(" ");
 
             asrInfo.setText(
-                    wantWhisper
+                    runWhisper
                             ? "Whisper: уточняю русский и английский..."
                             : "Vosk: итоговая расшифровка"
             );
@@ -1686,116 +1996,164 @@ public class Main {
             String result = draft;
             String error = "";
 
-            if (wantWhisper) {
-                try {
-                    result = callWhisper(finalWav);
-
-                } catch (Exception ex) {
-                    error = ex.getMessage();
-                    result = draft;
-                }
-            }
-
-            final String finalText = result;
-            final String issue = error;
-
             try {
-                Files.createDirectories(HISTORY);
+                if (runWhisper) {
+                    try {
+                        result = callWhisper(recordPath);
 
-                Files.writeString(
-                        HISTORY.resolve(
-                                finalWav.getFileName()
+                    } catch (Exception ex) {
+                        error = ex.getMessage();
+                        result = draft;
+                    }
+                }
+
+                if (
+                        retain &&
+                                recordPath != null
+                ) {
+                    try {
+                        Files.createDirectories(HISTORY);
+
+                        Path txt = HISTORY.resolve(
+                                recordPath.getFileName()
                                         .toString()
-                                        .replace(".wav", ".txt")
-                        ),
-                        "Vosk:\n" + draft +
-                                "\n\nИтог:\n" + finalText,
-                        StandardCharsets.UTF_8
-                );
+                                        .replaceFirst(
+                                                "\\.wav$",
+                                                ".txt"
+                                        )
+                        );
 
-            } catch (IOException ignored) {
-            }
+                        Files.writeString(
+                                txt,
+                                "Vosk:\n" + draft +
+                                        "\n\nИтог:\n" + result,
+                                StandardCharsets.UTF_8
+                        );
 
-            if (!enabled || generation.get() != token) {
-                return;
-            }
+                    } catch (IOException ex) {
+                        System.err.println(
+                                "Не удалось сохранить историю: " +
+                                        ex
+                        );
+                    }
+                }
 
-            ui(() -> {
-                if (!enabled || generation.get() != token) {
+                if (
+                        !enabled ||
+                                generation.get() != token
+                ) {
                     return;
                 }
 
-                lastText = finalText;
+                String finalText = result;
+                String issue = error;
 
-                if (!finalText.isBlank()) {
-                    transcript.setText(
-                            "ИТОГ:\n" + finalText +
-                                    "\n\n---\nVosk (черновик):\n" +
-                                    draft
-                    );
-
-                    try {
-                        Toolkit.getDefaultToolkit()
-                                .getSystemClipboard()
-                                .setContents(
-                                        new StringSelection(finalText),
-                                        null
-                                );
-
-                    } catch (IllegalStateException ignored) {
+                ui(() -> {
+                    if (
+                            !enabled ||
+                                    generation.get() != token
+                    ) {
+                        return;
                     }
 
-                    if (autoSubmit && !wasTest) {
-                        queueBrowserJob(finalText);
-                    }
-                }
+                    lastText = finalText;
 
-                if (!issue.isBlank()) {
+                    if (!finalText.isBlank()) {
+                        transcript.setText(
+                                "ИТОГ:\n" + finalText +
+                                        "\n\n---\nVosk (черновик):\n" +
+                                        draft
+                        );
+
+                        try {
+                            Toolkit.getDefaultToolkit()
+                                    .getSystemClipboard()
+                                    .setContents(
+                                            new StringSelection(
+                                                    finalText
+                                            ),
+                                            null
+                                    );
+
+                        } catch (
+                                IllegalStateException ignored
+                        ) {
+                        }
+
+                        if (
+                                autoSubmit &&
+                                        !wasTest
+                        ) {
+                            queueBrowserJob(finalText);
+                        }
+                    }
+
                     asrInfo.setText(
-                            "Whisper недоступен, оставил Vosk: " +
+                            !issue.isBlank()
+                                    ? "Whisper недоступен, оставил Vosk: " +
                                     issue
-                    );
-
-                } else {
-                    asrInfo.setText(
-                            wantWhisper
+                                    : runWhisper
                                     ? "Whisper: расшифровка готова"
                                     : "Vosk: текст готов"
                     );
+                });
+
+            } finally {
+                if (
+                        !retain &&
+                                recordPath != null
+                ) {
+                    try {
+                        Files.deleteIfExists(recordPath);
+
+                    } catch (IOException ex) {
+                        System.err.println(
+                                "Не удалён временный WAV: " +
+                                        ex
+                        );
+                    }
                 }
-            });
+
+                processing.decrementAndGet();
+            }
         });
     }
 
     private String callWhisper(
-            Path wavFile
+            Path file
     ) throws Exception {
-        byte[] wavBytes =
-                Files.readAllBytes(wavFile);
+        byte[] body =
+                Files.readAllBytes(file);
 
-        HttpRequest request = HttpRequest.newBuilder(
-                        URI.create(
-                                "http://127.0.0.1:" +
-                                        WHISPER_PORT +
-                                        "/transcribe"
+        HttpRequest request =
+                HttpRequest.newBuilder(
+                                URI.create(
+                                        "http://127.0.0.1:" +
+                                                WHISPER_PORT +
+                                                "/transcribe"
+                                )
                         )
-                )
-                .header(
-                        "Content-Type",
-                        "audio/wav"
-                )
-                .timeout(Duration.ofMinutes(8))
-                .POST(
-                        HttpRequest.BodyPublishers
-                                .ofByteArray(wavBytes)
-                )
-                .build();
+                        .header(
+                                "Content-Type",
+                                "audio/wav"
+                        )
+                        .timeout(
+                                Duration.ofMinutes(8)
+                        )
+                        .POST(
+                                HttpRequest.BodyPublishers
+                                        .ofByteArray(body)
+                        )
+                        .build();
 
-        HttpResponse<String> response = http.send(
-                request,
-                HttpResponse.BodyHandlers
-                        .ofString(StandardCharsets.UTF_8)
-        );
+        HttpResponse<String> response =
+                http.send(
+                        request,
+                        HttpResponse.BodyHandlers
+                                .ofString(
+                                        StandardCharsets.UTF_8
+                                )
+                );
 
         if (response.statusCode() != 200) {
             throw new IOException(
@@ -1812,7 +2170,7 @@ public class Main {
 
         if (result.isBlank()) {
             throw new IOException(
-                    "модель вернула пустой текст"
+                    "Whisper вернул пустой текст"
             );
         }
 
@@ -1851,16 +2209,21 @@ public class Main {
                 )
         };
 
-        for (Mixer.Info m :
-                AudioSystem.getMixerInfo()) {
-
-            String n = m.getName()
+        for (
+                Mixer.Info m :
+                AudioSystem.getMixerInfo()
+        ) {
+            String name = m.getName()
                     .toLowerCase(Locale.ROOT);
 
-            if (!(
-                    n.contains("cable output") ||
-                            n.contains("vb-audio virtual cable")
-            )) {
+            if (
+                    !(
+                            name.contains("cable output") ||
+                                    name.contains(
+                                            "vb-audio virtual cable"
+                                    )
+                    )
+            ) {
                 continue;
             }
 
@@ -1895,23 +2258,27 @@ public class Main {
             int length
     ) {
         double sum = 0;
-        int samples = 0;
+        int count = 0;
 
-        for (int i = 0; i + 1 < length; i += 2) {
-            short s = (short) (
+        for (
+                int i = 0;
+                i + 1 < length;
+                i += 2
+        ) {
+            short v = (short) (
                     (src[i] & 255) |
                             (src[i + 1] << 8)
             );
 
-            sum += (double) s * s;
-            samples++;
+            sum += (double) v * v;
+            count++;
         }
 
         return Math.min(
                 100,
                 (int) (
                         Math.sqrt(
-                                sum / Math.max(1, samples)
+                                sum / Math.max(count, 1)
                         ) / 110
                 )
         );
@@ -1930,7 +2297,7 @@ public class Main {
                 int channels
         ) {
             this.channels = channels;
-            ratio = sourceRate / SAMPLE_RATE;
+            this.ratio = sourceRate / SAMPLE_RATE;
             reset();
         }
 
@@ -1941,7 +2308,7 @@ public class Main {
 
         int convert(
                 byte[] src,
-                int n,
+                int length,
                 byte[] dest
         ) {
             int pos = 0;
@@ -1949,12 +2316,16 @@ public class Main {
 
             for (
                     int i = 0;
-                    i + frame <= n;
+                    i + frame <= length;
                     i += frame
             ) {
                 double value = 0;
 
-                for (int c = 0; c < channels; c++) {
+                for (
+                        int c = 0;
+                        c < channels;
+                        c++
+                ) {
                     int p = i + 2 * c;
 
                     value += (short) (
@@ -1978,7 +2349,7 @@ public class Main {
                     remaining -= part;
 
                     if (remaining < 1e-9) {
-                        int sample = Math.max(
+                        int v = Math.max(
                                 -32768,
                                 Math.min(
                                         32767,
@@ -1988,10 +2359,9 @@ public class Main {
                                 )
                         );
 
-                        dest[pos++] = (byte) sample;
-
+                        dest[pos++] = (byte) v;
                         dest[pos++] =
-                                (byte) (sample >>> 8);
+                                (byte) (v >>> 8);
 
                         remaining = ratio;
                         sum = 0;
@@ -2036,18 +2406,18 @@ public class Main {
             return bytes;
         }
 
-        private void little32(long x)
+        private void little32(long n)
                 throws IOException {
-            file.write((int) x & 255);
-            file.write((int) (x >> 8) & 255);
-            file.write((int) (x >> 16) & 255);
-            file.write((int) (x >> 24) & 255);
+            file.write((int) n & 255);
+            file.write((int) (n >> 8) & 255);
+            file.write((int) (n >> 16) & 255);
+            file.write((int) (n >> 24) & 255);
         }
 
-        private void little16(int x)
+        private void little16(int n)
                 throws IOException {
-            file.write(x & 255);
-            file.write((x >> 8) & 255);
+            file.write(n & 255);
+            file.write((n >> 8) & 255);
         }
 
         @Override
@@ -2087,18 +2457,15 @@ public class Main {
         );
 
         AudioFormat probe = new AudioFormat(
-                44100,
-                16,
-                1,
-                true,
-                false
+                44100, 16, 1, true, false
         );
 
-        for (Mixer.Info i :
-                AudioSystem.getMixerInfo()) {
-
+        for (
+                Mixer.Info info :
+                AudioSystem.getMixerInfo()
+        ) {
             if (
-                    AudioSystem.getMixer(i)
+                    AudioSystem.getMixer(info)
                             .isLineSupported(
                                     new DataLine.Info(
                                             SourceDataLine.class,
@@ -2108,8 +2475,8 @@ public class Main {
             ) {
                 result.add(
                         new OutputDevice(
-                                i.getName(),
-                                i
+                                info.getName(),
+                                info
                         )
                 );
             }
@@ -2125,22 +2492,27 @@ public class Main {
                 true
         );
 
-        dialog.setSize(640, 365);
+        dialog.setSize(680, 480);
+
+        dialog.setMinimumSize(
+                new Dimension(600, 450)
+        );
+
         dialog.setLocationRelativeTo(frame);
 
-        JPanel root = new JPanel(
+        JPanel form = new JPanel(
                 new GridBagLayout()
         );
 
-        root.setBorder(
-                new EmptyBorder(16, 16, 16, 16)
+        form.setBorder(
+                new EmptyBorder(16, 18, 12, 18)
         );
 
         GridBagConstraints c =
                 new GridBagConstraints();
 
         c.insets =
-                new Insets(7, 4, 7, 7);
+                new Insets(6, 4, 6, 8);
 
         c.anchor =
                 GridBagConstraints.WEST;
@@ -2148,7 +2520,7 @@ public class Main {
         c.gridx = 0;
         c.gridy = 0;
 
-        root.add(
+        form.add(
                 new JLabel("Колонки для сигнала:"),
                 c
         );
@@ -2165,13 +2537,17 @@ public class Main {
                 i < devices.getItemCount();
                 i++
         ) {
+            OutputDevice d =
+                    devices.getItemAt(i);
+
             if (
-                    devices.getItemAt(i)
-                            .name()
-                            .equals(speakerName) ||
+                    (
+                            d.info() == null &&
+                                    speakerName.isBlank()
+                    ) ||
                             (
-                                    speakerName.isBlank() &&
-                                            i == 0
+                                    d.info() != null &&
+                                            d.name().equals(speakerName)
                             )
             ) {
                 devices.setSelectedIndex(i);
@@ -2181,76 +2557,168 @@ public class Main {
 
         c.gridx = 1;
         c.weightx = 1;
-        c.fill =
-                GridBagConstraints.HORIZONTAL;
+        c.fill = GridBagConstraints.HORIZONTAL;
 
-        root.add(devices, c);
+        form.add(devices, c);
 
         c.gridx = 0;
         c.gridy++;
         c.weightx = 0;
         c.fill = GridBagConstraints.NONE;
 
-        root.add(
-                new JLabel("Громкость уведомления:"),
+        form.add(
+                new JLabel("Громкость сигнала:"),
                 c
         );
 
         JSlider volumeSlider = new JSlider(
-                0,
-                100,
-                volume
+                0, 100, volume
+        );
+
+        JLabel percent =
+                new JLabel(volume + "%");
+
+        volumeSlider.addChangeListener(
+                e -> percent.setText(
+                        volumeSlider.getValue() + "%"
+                )
+        );
+
+        JPanel sliderRow =
+                new JPanel(new BorderLayout(10, 0));
+
+        sliderRow.add(
+                volumeSlider,
+                BorderLayout.CENTER
+        );
+
+        sliderRow.add(
+                percent,
+                BorderLayout.EAST
         );
 
         c.gridx = 1;
         c.weightx = 1;
-        c.fill =
-                GridBagConstraints.HORIZONTAL;
+        c.fill = GridBagConstraints.HORIZONTAL;
 
-        root.add(volumeSlider, c);
+        form.add(sliderRow, c);
 
         c.gridx = 0;
         c.gridy++;
         c.weightx = 0;
         c.fill = GridBagConstraints.NONE;
 
-        root.add(
-                new JLabel("Уточнять речь через Whisper:"),
+        form.add(
+                new JLabel("Распознавание:"),
                 c
         );
 
-        JCheckBox whisper = new JCheckBox(
-                "Использовать GPU-модель после звонка",
-                useWhisper
-        );
+        JCheckBox whisperCheck =
+                new JCheckBox(
+                        "Уточнять через GPU Whisper",
+                        useWhisper
+                );
 
         c.gridx = 1;
-        root.add(whisper, c);
+        c.weightx = 1;
+        c.fill = GridBagConstraints.HORIZONTAL;
+
+        form.add(whisperCheck, c);
 
         c.gridx = 0;
         c.gridy++;
+        c.weightx = 0;
+        c.fill = GridBagConstraints.NONE;
 
-        root.add(
+        form.add(
+                new JLabel("История звонков:"),
+                c
+        );
+
+        JCheckBox logCheck =
+                new JCheckBox(
+                        "Сохранять логи (WAV и TXT)",
+                        saveLogs
+                );
+
+        c.gridx = 1;
+        c.weightx = 1;
+        c.fill = GridBagConstraints.HORIZONTAL;
+
+        form.add(logCheck, c);
+
+        c.gridx = 0;
+        c.gridy++;
+        c.gridwidth = 2;
+        c.weightx = 1;
+        c.fill = GridBagConstraints.HORIZONTAL;
+
+        JLabel hint = new JLabel(
+                "Выключение записи применяется со следующего звонка."
+        );
+
+        hint.setForeground(
+                new Color(90, 90, 90)
+        );
+
+        form.add(hint, c);
+
+        c.gridy++;
+
+        JPanel logActions = new JPanel(
+                new FlowLayout(
+                        FlowLayout.LEFT,
+                        9, 0
+                )
+        );
+
+        JButton openFolder =
+                new JButton("Открыть папку логов");
+
+        openFolder.addActionListener(
+                e -> openLogFolder()
+        );
+
+        JButton clearLogs =
+                new JButton("Очистить все логи");
+
+        clearLogs.addActionListener(
+                e -> clearAllLogs(dialog)
+        );
+
+        logActions.add(openFolder);
+        logActions.add(clearLogs);
+
+        form.add(logActions, c);
+
+        c.gridwidth = 1;
+        c.gridx = 0;
+        c.gridy++;
+        c.weightx = 0;
+        c.fill = GridBagConstraints.NONE;
+
+        form.add(
                 new JLabel("HTTP пользователь Snom:"),
                 c
         );
 
         JTextField user = new JTextField(
                 snomUser,
-                15
+                16
         );
 
         c.gridx = 1;
-        c.fill =
-                GridBagConstraints.HORIZONTAL;
+        c.weightx = 1;
+        c.fill = GridBagConstraints.HORIZONTAL;
 
-        root.add(user, c);
+        form.add(user, c);
 
         c.gridx = 0;
         c.gridy++;
+        c.weightx = 0;
         c.fill = GridBagConstraints.NONE;
 
-        root.add(
+        form.add(
                 new JLabel("HTTP пароль Snom:"),
                 c
         );
@@ -2258,54 +2726,71 @@ public class Main {
         JPasswordField pass =
                 new JPasswordField(
                         snomPassword,
-                        15
+                        16
                 );
 
         c.gridx = 1;
-        c.fill =
-                GridBagConstraints.HORIZONTAL;
+        c.weightx = 1;
+        c.fill = GridBagConstraints.HORIZONTAL;
 
-        root.add(pass, c);
+        form.add(pass, c);
 
         JPanel footer = new JPanel(
-                new FlowLayout(FlowLayout.RIGHT)
+                new FlowLayout(
+                        FlowLayout.RIGHT
+                )
         );
 
-        JButton check =
+        JButton testSound =
                 new JButton("Проверить звук");
 
-        check.addActionListener(e -> {
-            OutputDevice device =
+        testSound.addActionListener(e -> {
+            OutputDevice dev =
                     (OutputDevice) devices.getSelectedItem();
 
             playSignalOn(
-                    device == null
+                    dev == null
                             ? null
-                            : device.info(),
+                            : dev.info(),
                     volumeSlider.getValue()
             );
         });
+
+        JButton cancel =
+                new JButton("Отмена");
+
+        cancel.addActionListener(
+                e -> dialog.dispose()
+        );
 
         JButton save =
                 new JButton("Сохранить");
 
         save.addActionListener(e -> {
-            OutputDevice device =
+            OutputDevice dev =
                     (OutputDevice) devices.getSelectedItem();
 
             speakerName =
-                    device == null ||
-                            device.info() == null
+                    dev == null ||
+                            dev.info() == null
                             ? ""
-                            : device.name();
+                            : dev.name();
 
             volume = volumeSlider.getValue();
-            useWhisper = whisper.isSelected();
 
-            snomUser = user.getText().trim();
+            useWhisper =
+                    whisperCheck.isSelected();
+
+            saveLogs =
+                    logCheck.isSelected();
+
+            snomUser =
+                    user.getText().trim();
 
             snomPassword =
-                    new String(pass.getPassword());
+                    new String(
+                            pass.getPassword()
+                    );
 
             prefs.put(
                     "speaker",
@@ -2322,46 +2807,186 @@ public class Main {
                     useWhisper
             );
 
+            prefs.putBoolean(
+                    "saveLogs",
+                    saveLogs
+            );
+
             dialog.dispose();
         });
 
-        JButton cancel =
-                new JButton("Отмена");
-
-        cancel.addActionListener(e ->
-                dialog.dispose()
-        );
-
-        footer.add(check);
+        footer.add(testSound);
         footer.add(cancel);
         footer.add(save);
 
         dialog.setLayout(new BorderLayout());
-        dialog.add(root);
-        dialog.add(footer, BorderLayout.SOUTH);
+
+        dialog.add(
+                new JScrollPane(form),
+                BorderLayout.CENTER
+        );
+
+        dialog.add(
+                footer,
+                BorderLayout.SOUTH
+        );
 
         dialog.setVisible(true);
+    }
+
+    private void openLogFolder() {
+        try {
+            Files.createDirectories(HISTORY);
+
+            if (
+                    !Desktop.isDesktopSupported() ||
+                            !Desktop.getDesktop().isSupported(
+                                    Desktop.Action.OPEN
+                            )
+            ) {
+                throw new IOException(
+                        "Открытие папок не поддерживается в этой системе"
+                );
+            }
+
+            Desktop.getDesktop().open(
+                    HISTORY.toFile()
+            );
+
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(
+                    frame,
+                    "Не удалось открыть папку:\n" +
+                            HISTORY + "\n" +
+                            ex.getMessage(),
+                    "Папка логов",
+                    JOptionPane.ERROR_MESSAGE
+            );
+        }
+    }
+
+    private void clearAllLogs(Component parent) {
+        if (
+                active ||
+                        processing.get() > 0
+        ) {
+            JOptionPane.showMessageDialog(
+                    parent,
+                    "Сейчас идёт звонок или распознавание. " +
+                            "Дождись окончания, потом очисти логи.",
+                    "Удаление логов",
+                    JOptionPane.INFORMATION_MESSAGE
+            );
+
+            return;
+        }
+
+        int confirm = JOptionPane.showConfirmDialog(
+                parent,
+                "Удалить все сохранённые файлы из папки?\n" +
+                        HISTORY +
+                        "\n\nДействие нельзя отменить.",
+                "Очистить все логи",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE
+        );
+
+        if (
+                confirm != JOptionPane.YES_OPTION
+        ) {
+            return;
+        }
+
+        try {
+            if (!Files.exists(HISTORY)) {
+                JOptionPane.showMessageDialog(
+                        parent,
+                        "Папка истории уже пуста."
+                );
+                return;
+            }
+
+            int deleted = 0;
+            int failed = 0;
+
+            try (
+                    DirectoryStream<Path> files =
+                            Files.newDirectoryStream(HISTORY)
+            ) {
+                for (Path file : files) {
+                    if (
+                            !Files.isRegularFile(
+                                    file,
+                                    LinkOption.NOFOLLOW_LINKS
+                            )
+                    ) {
+                        continue;
+                    }
+
+                    if (
+                            active ||
+                                    processing.get() > 0
+                    ) {
+                        break;
+                    }
+
+                    try {
+                        Files.delete(file);
+                        deleted++;
+
+                    } catch (IOException ex) {
+                        failed++;
+                    }
+                }
+            }
+
+            JOptionPane.showMessageDialog(
+                    parent,
+                    "Удалено файлов: " + deleted +
+                            (
+                                    failed > 0
+                                            ? "\nНе удалось удалить: " +
+                                            failed
+                                            : ""
+                            ),
+                    "Очистка логов",
+                    JOptionPane.INFORMATION_MESSAGE
+            );
+
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(
+                    parent,
+                    "Ошибка очистки: " +
+                            ex.getMessage(),
+                    "Очистка логов",
+                    JOptionPane.ERROR_MESSAGE
+            );
+        }
     }
 
     private void playSignal() {
         Mixer.Info chosen = null;
 
         if (!speakerName.isBlank()) {
-            for (Mixer.Info info :
-                    AudioSystem.getMixerInfo()) {
-
+            for (
+                    Mixer.Info info :
+                    AudioSystem.getMixerInfo()
+            ) {
                 if (
                         info.getName()
                                 .equals(speakerName)
                 ) {
                     chosen = info;
+                    break;
                 }
             }
 
             if (chosen == null) {
                 chromeInfo.setText(
-                        "Колонки не найдены: " + speakerName
+                        "Колонки не найдены: " +
+                                speakerName
                 );
+
                 return;
             }
         }
@@ -2374,7 +2999,7 @@ public class Main {
             int level
     ) {
         daemon(() -> {
-            AudioFormat format = new AudioFormat(
+            AudioFormat f = new AudioFormat(
                     44100,
                     16,
                     1,
@@ -2383,31 +3008,33 @@ public class Main {
             );
 
             try (
-                    SourceDataLine output =
+                    SourceDataLine line =
                             mixer == null
-                                    ? AudioSystem.getSourceDataLine(
-                                    format
-                            )
+                                    ? AudioSystem.getSourceDataLine(f)
                                     : AudioSystem.getSourceDataLine(
-                                    format,
+                                    f,
                                     mixer
                             )
             ) {
-                output.open(format);
-                output.start();
+                line.open(f);
+                line.start();
 
-                int rate = 44100;
+                for (
+                        int tone = 0;
+                        tone < 2;
+                        tone++
+                ) {
+                    int count =
+                            tone == 0 ? 7000 : 9500;
 
-                for (int tone = 0; tone < 2; tone++) {
-                    int count = tone == 0
-                            ? 7000
-                            : 9500;
+                    byte[] data =
+                            new byte[count * 2];
 
-                    byte[] bytes = new byte[
-                            count * 2
-                            ];
-
-                    for (int i = 0; i < count; i++) {
+                    for (
+                            int i = 0;
+                            i < count;
+                            i++
+                    ) {
                         double fade = Math.min(
                                 1,
                                 Math.min(
@@ -2424,39 +3051,205 @@ public class Main {
                                                                 ? 720
                                                                 : 980
                                                 ) *
-                                                i / rate
+                                                i / 44100.0
                                 ) *
                                         24000 *
                                         fade *
                                         level / 100.0
                         );
 
-                        bytes[i * 2] =
+                        data[2 * i] =
                                 (byte) sample;
 
-                        bytes[i * 2 + 1] =
-                                (byte) (sample >> 8);
+                        data[2 * i + 1] =
+                                (byte) (sample >>> 8);
                     }
 
-                    output.write(
-                            bytes,
+                    line.write(
+                            data,
                             0,
-                            bytes.length
+                            data.length
                     );
                 }
 
-                output.drain();
+                line.drain();
 
             } catch (Exception ex) {
                 ui(() -> chromeInfo.setText(
-                        "Ошибка звука: " + ex.getMessage()
+                        "Ошибка звука: " +
+                                ex.getMessage()
                 ));
             }
         }, "audio-alert").start();
     }
 
+    private void startWhisperAutomatically() {
+        Path root = Path.of(
+                System.getProperty("user.dir")
+        ).toAbsolutePath();
+
+        Path python = root.resolve(
+                ".venv/Scripts/python.exe"
+        );
+
+        Path script = root.resolve(
+                "asr_server.py"
+        );
+
+        if (!useWhisper) {
+            ui(() -> asrInfo.setText(
+                    "Whisper отключён в настройках"
+            ));
+            return;
+        }
+
+        if (
+                !Files.isRegularFile(python) ||
+                        !Files.isRegularFile(script)
+        ) {
+            ui(() -> asrInfo.setText(
+                    "Whisper: нет .venv или asr_server.py"
+            ));
+            return;
+        }
+
+        if (whisperReady()) {
+            ui(() -> asrInfo.setText(
+                    "Whisper: уже работает"
+            ));
+            return;
+        }
+
+        try {
+            ProcessBuilder builder =
+                    new ProcessBuilder(
+                            python.toString(),
+                            script.toString()
+                    );
+
+            builder.directory(root.toFile());
+            builder.redirectErrorStream(true);
+
+            builder.environment().put(
+                    "PYTHONUNBUFFERED",
+                    "1"
+            );
+
+            builder.environment().put(
+                    "PYTHONIOENCODING",
+                    "utf-8"
+            );
+
+            Process process = builder.start();
+            whisperProcess = process;
+
+            daemon(() -> {
+                try (
+                        BufferedReader reader =
+                                new BufferedReader(
+                                        new InputStreamReader(
+                                                process.getInputStream(),
+                                                StandardCharsets.UTF_8
+                                        )
+                                )
+                ) {
+                    String line;
+
+                    while (
+                            (line = reader.readLine()) != null
+                    ) {
+                        System.out.println(
+                                "[Whisper] " + line
+                        );
+                    }
+
+                } catch (IOException ignored) {
+                }
+            }, "whisper-log").start();
+
+            for (
+                    int i = 0;
+                    i < 180 && !closing;
+                    i++
+            ) {
+                if (whisperReady()) {
+                    ui(() -> asrInfo.setText(
+                            "Whisper RU+EN: готов · RTX 3050"
+                    ));
+                    return;
+                }
+
+                if (!process.isAlive()) {
+                    ui(() -> asrInfo.setText(
+                            "Whisper завершился · проверь консоль IntelliJ"
+                    ));
+                    return;
+                }
+
+                Thread.sleep(1000);
+            }
+
+        } catch (Exception ex) {
+            ui(() -> asrInfo.setText(
+                    "Whisper: " +
+                            ex.getMessage()
+            ));
+        }
+    }
+
+    private boolean whisperReady() {
+        try {
+            HttpRequest request =
+                    HttpRequest.newBuilder(
+                                    URI.create(
+                                            "http://127.0.0.1:" +
+                                                    WHISPER_PORT +
+                                                    "/health"
+                                    )
+                            )
+                            .timeout(
+                                    Duration.ofSeconds(2)
+                            )
+                            .GET()
+                            .build();
+
+            HttpResponse<String> response =
+                    http.send(
+                            request,
+                            HttpResponse.BodyHandlers
+                                    .ofString(
+                                            StandardCharsets.UTF_8
+                                    )
+                    );
+
+            return response.statusCode() == 200 &&
+                    "ready".equals(
+                            field(
+                                    response.body(),
+                                    "status"
+                            )
+                    );
+
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+
+    private void stopWhisperAutomatically() {
+        Process p = whisperProcess;
+        whisperProcess = null;
+
+        if (
+                p != null &&
+                        p.isAlive()
+        ) {
+            p.destroy();
+        }
+    }
+
     private void shutdown() {
         closing = true;
+        generation.incrementAndGet();
 
         if (uiTimer != null) {
             uiTimer.stop();
@@ -2480,6 +3273,8 @@ public class Main {
 
         dialWorker.shutdownNow();
         speechWorker.shutdownNow();
+
+        stopWhisperAutomatically();
 
         frame.dispose();
     }
