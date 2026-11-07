@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Snom ChatGPT Bridge",
+  "version": "1.0.0",
+  "description": "Связь локального Java-приложения Snom с выбранной вкладкой ChatGPT.",
+  "permissions": ["tabs"],
+  "host_permissions": [
+    "http://127.0.0.1:47624/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

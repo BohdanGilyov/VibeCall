@@ -4,6 +4,8 @@ package absolutely.real;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
 import org.vosk.LibVosk;
 import org.vosk.LogLevel;
 import org.vosk.Model;
@@ -14,128 +16,113 @@ import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.datatransfer.StringSelection;
-import java.awt.event.WindowAdapter;
-import java.awt.event.WindowEvent;
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.net.*;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.*;
 import java.util.List;
+import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class Main {
-
-    private static final int EVENT_PORT = 47621;
-    private static final int SNOM_HOOK_PORT = 47622;
-    private static final String PC_IP = "192.168.50.1";
-    private static final String SNOM_IP = "192.168.50.2";
-
-    private static final float VOSK_RATE = 16000;
-    private static final long HANGUP_GRACE_NS = 600_000_000L;
-    private static final String MODEL_NAME = "gpt-4.1-mini";
-
+    private static final String PC = "192.168.50.1";
+    private static final String SNOM = "192.168.50.2";
+    private static final int PHONE_PORT = 47622;
+    private static final int MICROSIP_PORT = 47621;
+    private static final int CHROME_PORT = 47624;
+    private static final float VOSK_HZ = 16000;
+    private static final long FINISH_DELAY_NS = 500_000_000L;
     private static final Path HISTORY = Path.of("transcripts");
-
-    private static final DateTimeFormatter STAMP =
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final DateTimeFormatter FILE_STAMP =
             DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss_SSS");
-
     private static final DateTimeFormatter CLOCK =
             DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final Color BG = new Color(10, 17, 29);
+    private static final Color CARD = new Color(22, 34, 52);
+    private static final Color SECOND = new Color(33, 49, 71);
+    private static final Color FG = new Color(242, 248, 255);
+    private static final Color MUTE = new Color(153, 172, 193);
+    private static final Color CYAN = new Color(80, 222, 192);
+    private static final Color BLUE = new Color(116, 181, 255);
 
-    private static final Color BG = new Color(15, 23, 42);
-    private static final Color CARD = new Color(30, 41, 59);
-    private static final Color FG = new Color(241, 245, 249);
-    private static final Color SECONDARY = new Color(148, 163, 184);
-    private static final Color GREEN = new Color(74, 222, 128);
+    private final JFrame frame = new JFrame("Snom AI Bridge 4.1");
+    private final JLabel phoneStatus =
+            text("Ожидание снятия трубки", 19, true, FG);
+    private final JLabel phoneDetail =
+            text("Snom: подключение по 192.168.50.1:47622", 12, false, MUTE);
+    private final JLabel speechStatus =
+            text("Загрузка Vosk...", 13, false, MUTE);
+    private final JLabel chromeStatus =
+            text("Ожидаю вкладку ChatGPT...", 13, false, MUTE);
+    private final JLabel partial =
+            text("Здесь появятся распознаваемые слова", 13, false, BLUE);
+    private final JLabel clock = text("00:00", 34, true, FG);
+    private final JTextArea transcript = new JTextArea();
+    private final JProgressBar meter = new JProgressBar(0, 100);
+    private final JComboBox<Tab> targetBox = new JComboBox<>();
+    private final JCheckBox autoSend =
+            new JCheckBox("Отправлять в ChatGPT автоматически", true);
+    private final JTextField httpUser = new JTextField(7);
+    private final JPasswordField httpPass = new JPasswordField(9);
 
-    private final JFrame frame =
-            new JFrame("Snom Transcriber 3.2 · AI Call");
-
-    private final JLabel status =
-            new JLabel("Ожидание звонка на 101");
-
-    private final JLabel duration = new JLabel("00:00");
-
-    private final JLabel audioStatus =
-            new JLabel("Подключение к VB-CABLE...");
-
-    private final JLabel apiStatus =
-            new JLabel("OpenAI API: проверка ключа...");
-
-    private final JLabel preview = new JLabel("Слушаю...");
-
-    private final JLabel eventStatus =
-            new JLabel("MicroSIP: ожидаю событие на 127.0.0.1:47621");
-
-    private final JLabel hookStatus =
-            new JLabel("Snom: ожидаю сигнал при укладывании трубки");
-
-    private final JProgressBar level =
-            new JProgressBar(0, 100);
-
-    private final JTextArea words = new JTextArea();
-    private final JTextArea answer = new JTextArea();
-
-    private final JCheckBox automatic =
-            new JCheckBox("Отправлять текст в ИИ после звонка", true);
-
-    private final JCheckBox testMode =
-            new JCheckBox("Тест без телефонного звонка");
-
-    private final BlockingQueue<PhoneEvent> events =
+    private final BlockingQueue<String> phoneEvents =
             new LinkedBlockingQueue<>();
+    private final ConcurrentMap<Long, Tab> tabs =
+            new ConcurrentHashMap<>();
+    private final AtomicLong jobSequence = new AtomicLong(1);
+    private final ExecutorService dialExecutor =
+            Executors.newSingleThreadExecutor(
+                    r -> daemon(r, "snom-dial")
+            );
 
-    private final ExecutorService apiWorker =
-            Executors.newSingleThreadExecutor(r -> {
-                Thread thread = new Thread(r, "openai-api");
-                thread.setDaemon(true);
-                return thread;
-            });
-
-    private final HttpClient http = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(12))
-            .build();
-
-    private final String apiKey =
-            System.getenv("OPENAI_API_KEY");
-
+    private volatile BrowserJob browserJob;
+    private volatile long selectedTab = -1;
+    private volatile long pendingJob = -1;
+    private volatile long pendingTab = -1;
     private volatile boolean closing;
-    private volatile boolean creditsExhausted;
-    private volatile boolean autoSend = true;
-    private volatile boolean connected;
-
-    private volatile long startedAt;
-    private volatile long stoppedDuration;
-
+    private volatile boolean recording;
+    private volatile long startNanos;
+    private volatile long frozenNanos;
     private volatile String lastPrompt = "";
-    private volatile TargetDataLine audioLine;
+    private volatile TargetDataLine inputLine;
+    private volatile boolean autoSubmit = true;
 
-    private DatagramSocket socket;
-    private ServerSocket snomHookServer;
-    private javax.swing.Timer timer;
-
-    private boolean activeSession;
+    private boolean active;
+    private boolean finishing;
     private boolean testSession;
+    private volatile boolean callEstablished;
     private long finishAt;
-    private Path callFile;
+    private long lastHangupAt;
+    private Path sessionFile;
+    private final StringBuilder spoken = new StringBuilder();
+    private boolean rebuildingTabs;
+    private boolean warnedMissingCall;
 
-    private final StringBuilder recognized =
-            new StringBuilder();
+    private HttpServer browserServer;
+    private HttpServer snomServer;
+    private DatagramSocket sipSocket;
+    private javax.swing.Timer swingTimer;
 
-    private record PhoneEvent(String name, String caller) {}
+    private record Tab(
+            long id,
+            long window,
+            String title,
+            long seen
+    ) {
+        @Override
+        public String toString() {
+            return title + "   ·   окно " + window;
+        }
+    }
 
-    private record Capture(
+    private record BrowserJob(long id, long tabId, String text) {}
+
+    private record AudioIn(
             TargetDataLine line,
             AudioFormat format,
             String name
@@ -149,658 +136,845 @@ public class Main {
         frame.setDefaultCloseOperation(
                 WindowConstants.DO_NOTHING_ON_CLOSE
         );
-
-        frame.setSize(970, 740);
-        frame.setMinimumSize(new Dimension(750, 560));
+        frame.setSize(1040, 770);
+        frame.setMinimumSize(new Dimension(850, 630));
         frame.setLocationRelativeTo(null);
         frame.getContentPane().setBackground(BG);
-        frame.setLayout(new BorderLayout(12, 12));
+        frame.setLayout(new BorderLayout(0, 14));
 
-        JPanel header = panel(BG);
-        header.setBorder(new EmptyBorder(18, 20, 0, 20));
-        header.setLayout(new BorderLayout());
+        Rounded hero = new Rounded(
+                22,
+                new Color(23, 64, 84),
+                new Color(23, 46, 93)
+        );
+        hero.setBorder(new EmptyBorder(22, 26, 20, 26));
+        hero.setLayout(new BorderLayout());
 
-        header.add(
-                label("SNOM 320  ·  AI CALL", 22, true, FG),
+        JPanel heroLeft = transparent();
+        heroLeft.setLayout(
+                new BoxLayout(heroLeft, BoxLayout.Y_AXIS)
+        );
+        heroLeft.add(text(
+                "S N O M  /  A I   B R I D G E",
+                12, true, CYAN
+        ));
+        heroLeft.add(Box.createVerticalStrut(12));
+        heroLeft.add(text(
+                "Твой голос. Твой ChatGPT.",
+                27, true, FG
+        ));
+        heroLeft.add(Box.createVerticalStrut(9));
+        heroLeft.add(text(
+                "Сними трубку → диктуй → положи → получи сигнал",
+                13, false, FG
+        ));
+        hero.add(heroLeft, BorderLayout.CENTER);
+
+        JPanel heroRight = transparent();
+        heroRight.setLayout(
+                new BoxLayout(heroRight, BoxLayout.Y_AXIS)
+        );
+        clock.setAlignmentX(Component.RIGHT_ALIGNMENT);
+        phoneStatus.setAlignmentX(Component.RIGHT_ALIGNMENT);
+        heroRight.add(clock);
+        heroRight.add(Box.createVerticalStrut(8));
+        heroRight.add(phoneStatus);
+        hero.add(heroRight, BorderLayout.EAST);
+
+        JPanel north = transparent();
+        north.setBorder(new EmptyBorder(18, 22, 0, 22));
+        north.setLayout(new BorderLayout());
+        north.add(hero);
+        frame.add(north, BorderLayout.NORTH);
+
+        JPanel middle = transparent();
+        middle.setBorder(new EmptyBorder(0, 22, 0, 22));
+        middle.setLayout(new BorderLayout(0, 12));
+
+        Rounded statusCard = new Rounded(18, CARD, CARD);
+        statusCard.setBorder(new EmptyBorder(14, 18, 14, 18));
+        statusCard.setLayout(new GridLayout(3, 1, 0, 7));
+        statusCard.add(phoneDetail);
+        statusCard.add(speechStatus);
+        statusCard.add(chromeStatus);
+        middle.add(statusCard, BorderLayout.NORTH);
+
+        Rounded textCard = new Rounded(18, CARD, CARD);
+        textCard.setBorder(new EmptyBorder(14, 18, 14, 18));
+        textCard.setLayout(new BorderLayout(0, 10));
+        textCard.add(
+                text("РАСШИФРОВКА РАЗГОВОРА", 13, true, CYAN),
+                BorderLayout.NORTH
+        );
+
+        transcript.setEditable(false);
+        transcript.setLineWrap(true);
+        transcript.setWrapStyleWord(true);
+        transcript.setFont(
+                new Font("Segoe UI", Font.PLAIN, 17)
+        );
+        transcript.setForeground(FG);
+        transcript.setBackground(CARD);
+        transcript.setCaretColor(FG);
+        transcript.setText(
+                "Готово к работе. Сними трубку Snom 320 и говори.\n"
+        );
+
+        JScrollPane scroll = new JScrollPane(transcript);
+        scroll.setBorder(null);
+        scroll.getViewport().setBackground(CARD);
+        textCard.add(scroll, BorderLayout.CENTER);
+
+        meter.setForeground(CYAN);
+        meter.setBackground(SECOND);
+        meter.setBorderPainted(false);
+        meter.setPreferredSize(new Dimension(200, 9));
+
+        JPanel speechFooter = transparent();
+        speechFooter.setLayout(new BorderLayout(0, 7));
+        speechFooter.add(partial, BorderLayout.CENTER);
+        speechFooter.add(meter, BorderLayout.SOUTH);
+        textCard.add(speechFooter, BorderLayout.SOUTH);
+
+        middle.add(textCard, BorderLayout.CENTER);
+        frame.add(middle, BorderLayout.CENTER);
+
+        Rounded controls = new Rounded(18, CARD, CARD);
+        controls.setBorder(new EmptyBorder(15, 18, 17, 18));
+        controls.setLayout(new BorderLayout(0, 12));
+
+        JPanel selectRow = transparent();
+        selectRow.setLayout(new BorderLayout(12, 0));
+        selectRow.add(
+                text("КУДА ОТПРАВЛЯТЬ", 12, true, MUTE),
                 BorderLayout.WEST
         );
 
-        JPanel badge = panel(BG);
-        badge.setLayout(new BoxLayout(badge, BoxLayout.Y_AXIS));
+        targetBox.setFont(
+                new Font("Segoe UI", Font.PLAIN, 14)
+        );
+        targetBox.setBackground(SECOND);
+        targetBox.setForeground(FG);
 
-        status.setForeground(GREEN);
-        status.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        targetBox.addActionListener(e -> {
+            if (!rebuildingTabs) {
+                Tab t = (Tab) targetBox.getSelectedItem();
+                selectedTab = t == null ? -1 : t.id();
+            }
+        });
 
-        duration.setForeground(FG);
-        duration.setFont(new Font("Consolas", Font.BOLD, 25));
+        selectRow.add(targetBox, BorderLayout.CENTER);
+        controls.add(selectRow, BorderLayout.NORTH);
 
-        badge.add(status);
-        badge.add(duration);
-
-        header.add(badge, BorderLayout.EAST);
-        frame.add(header, BorderLayout.NORTH);
-
-        words.setText(
-                "Сними трубку Snom 320. " +
-                        "После завершения звонка текст будет отправлен в OpenAI.\n\n"
+        JPanel buttons = transparent();
+        buttons.setLayout(
+                new FlowLayout(FlowLayout.LEFT, 9, 0)
         );
 
-        setupText(words);
-        setupText(answer);
+        buttons.add(button(
+                "Начать тест",
+                true,
+                () -> phoneEvents.offer("test")
+        ));
 
-        answer.setText("Здесь будет ответ нейросети.\n");
+        buttons.add(button(
+                "Завершить",
+                false,
+                () -> phoneEvents.offer("hangup")
+        ));
 
-        JPanel t1 = textPanel(
-                "РАСПОЗНАННЫЙ ТЕКСТ", words
-        );
+        buttons.add(button(
+                "Отправить текст",
+                false,
+                () -> queueBrowserJob(lastPrompt)
+        ));
 
-        JPanel t2 = textPanel(
-                "ОТВЕТ ИИ", answer
-        );
-
-        JSplitPane split = new JSplitPane(
-                JSplitPane.VERTICAL_SPLIT,
-                t1,
-                t2
-        );
-
-        split.setResizeWeight(0.52);
-        split.setDividerSize(8);
-        split.setBorder(null);
-
-        JPanel middle = panel(BG);
-        middle.setBorder(new EmptyBorder(0, 20, 0, 20));
-        middle.setLayout(new BorderLayout(0, 10));
-
-        JPanel indicators = panel(CARD);
-
-        indicators.setLayout(
-                new BoxLayout(indicators, BoxLayout.Y_AXIS)
-        );
-
-        indicators.setBorder(
-                new EmptyBorder(10, 14, 10, 14)
-        );
-
-        audioStatus.setForeground(FG);
-        apiStatus.setForeground(SECONDARY);
-        preview.setForeground(new Color(147, 197, 253));
-
-        indicators.add(audioStatus);
-        indicators.add(Box.createVerticalStrut(6));
-
-        indicators.add(apiStatus);
-        indicators.add(Box.createVerticalStrut(6));
-
-        eventStatus.setForeground(SECONDARY);
-        indicators.add(eventStatus);
-        indicators.add(Box.createVerticalStrut(6));
-
-        hookStatus.setForeground(SECONDARY);
-        indicators.add(hookStatus);
-        indicators.add(Box.createVerticalStrut(8));
-
-        level.setPreferredSize(new Dimension(200, 10));
-
-        level.setMaximumSize(
-                new Dimension(Integer.MAX_VALUE, 10)
-        );
-
-        level.setForeground(GREEN);
-        level.setBackground(BG);
-        level.setBorderPainted(false);
-
-        indicators.add(level);
-        indicators.add(Box.createVerticalStrut(6));
-        indicators.add(preview);
-
-        middle.add(indicators, BorderLayout.NORTH);
-        middle.add(split, BorderLayout.CENTER);
-
-        frame.add(middle, BorderLayout.CENTER);
-
-        JPanel footer = panel(BG);
-        footer.setBorder(new EmptyBorder(0, 20, 18, 20));
-        footer.setLayout(new BorderLayout(0, 10));
-
-        JPanel buttons = panel(BG);
-        buttons.setLayout(new FlowLayout(FlowLayout.LEFT, 8, 0));
-
-        JButton copy = button("Копировать запрос");
-
-        copy.addActionListener(e ->
-                copyClipboard(
-                        lastPrompt,
-                        "Текст ещё не распознан."
+        buttons.add(button(
+                "Тест ChatGPT",
+                false,
+                () -> queueBrowserJob(
+                        "Проверка связи. Ответь одним коротким предложением."
                 )
+        ));
+
+        buttons.add(button(
+                "Проверить звук",
+                false,
+                this::playSignal
+        ));
+
+        controls.add(buttons, BorderLayout.CENTER);
+
+        JPanel preferences = transparent();
+        preferences.setLayout(
+                new FlowLayout(FlowLayout.LEFT, 12, 0)
         );
 
-        JButton send = button("Отправить повторно");
+        autoSend.setOpaque(false);
+        autoSend.setForeground(FG);
+        autoSend.addActionListener(
+                e -> autoSubmit = autoSend.isSelected()
+        );
+        preferences.add(autoSend);
 
-        send.addActionListener(e ->
-                sendToOpenAi(
-                        lastPrompt,
-                        "manual_" + STAMP.format(LocalDateTime.now()),
-                        true
-                )
+        preferences.add(text(
+                "HTTP пользователь Snom:",
+                12, false, MUTE
+        ));
+        preferences.add(httpUser);
+
+        preferences.add(text(
+                "пароль:", 12, false, MUTE
+        ));
+        preferences.add(httpPass);
+        controls.add(preferences, BorderLayout.SOUTH);
+
+        JPanel south = transparent();
+        south.setBorder(new EmptyBorder(0, 22, 20, 22));
+        south.setLayout(new BorderLayout());
+        south.add(controls);
+        frame.add(south, BorderLayout.SOUTH);
+
+        frame.addWindowListener(
+                new java.awt.event.WindowAdapter() {
+                    @Override
+                    public void windowClosing(
+                            java.awt.event.WindowEvent e
+                    ) {
+                        shutdown();
+                    }
+                }
         );
 
-        JButton folder = button("Открыть историю");
+        swingTimer = new javax.swing.Timer(400, e -> {
+            long seconds = (
+                    recording
+                            ? System.nanoTime() - startNanos
+                            : frozenNanos
+            ) / 1_000_000_000L;
 
-        folder.addActionListener(e -> {
-            try {
-                Files.createDirectories(HISTORY);
+            clock.setText(String.format(
+                    Locale.ROOT,
+                    "%02d:%02d",
+                    seconds / 60,
+                    seconds % 60
+            ));
 
-                Desktop.getDesktop().open(
-                        HISTORY.toAbsolutePath().toFile()
+            refreshTabs();
+
+            if (recording &&
+                    !callEstablished &&
+                    !warnedMissingCall &&
+                    System.nanoTime() - startNanos > 5_000_000_000L) {
+
+                warnedMissingCall = true;
+
+                phoneDetail.setText(
+                        "Нет подтверждения от 101: проверь регистрацию MicroSIP"
                 );
-
-            } catch (Exception ex) {
-                showError(ex.getMessage());
             }
         });
 
-        buttons.add(copy);
-        buttons.add(send);
-        buttons.add(folder);
-
-        JButton end = button("Завершить вручную");
-
-        end.addActionListener(e ->
-                events.offer(
-                        new PhoneEvent("ended", "кнопка")
-                )
-        );
-
-        buttons.add(end);
-        footer.add(buttons, BorderLayout.NORTH);
-
-        JPanel settings = panel(BG);
-
-        settings.setLayout(
-                new FlowLayout(FlowLayout.LEFT, 20, 0)
-        );
-
-        automatic.setForeground(FG);
-        automatic.setOpaque(false);
-
-        automatic.addActionListener(e ->
-                autoSend = automatic.isSelected()
-        );
-
-        testMode.setForeground(FG);
-        testMode.setOpaque(false);
-
-        testMode.addActionListener(e ->
-                events.offer(
-                        new PhoneEvent(
-                                testMode.isSelected()
-                                        ? "test_start"
-                                        : "test_end",
-                                "тест"
-                        )
-                )
-        );
-
-        settings.add(automatic);
-        settings.add(testMode);
-
-        footer.add(settings, BorderLayout.SOUTH);
-        frame.add(footer, BorderLayout.SOUTH);
-
-        frame.addWindowListener(new WindowAdapter() {
-            @Override
-            public void windowClosing(WindowEvent e) {
-                close();
-            }
-        });
-
-        timer = new javax.swing.Timer(
-                250,
-                e -> updateTimer()
-        );
-
-        timer.start();
-
-        apiStatus.setText(
-                apiKey == null || apiKey.isBlank()
-                        ? "OpenAI API: ключ OPENAI_API_KEY не найден"
-                        : "OpenAI API: ключ найден · модель " + MODEL_NAME
-        );
-
+        swingTimer.start();
         frame.setVisible(true);
 
-        startEventServer();
-        startSnomHookServer();
+        startBrowserServer();
+        startPhoneServer();
+        startMicroSipServer();
 
-        Thread worker = new Thread(
+        Thread audio = daemon(
                 this::capture,
-                "vosk-capture"
+                "vosk-audio"
         );
-
-        worker.setDaemon(true);
-        worker.start();
+        audio.start();
     }
 
-    private static JPanel panel(Color bg) {
+    private static Thread daemon(Runnable task, String name) {
+        Thread t = new Thread(task, name);
+        t.setDaemon(true);
+        return t;
+    }
+
+    private static JPanel transparent() {
         JPanel p = new JPanel();
-        p.setBackground(bg);
+        p.setOpaque(false);
         return p;
     }
 
-    private static JLabel label(
-            String text,
+    private static JLabel text(
+            String value,
             int size,
             boolean bold,
             Color color
     ) {
-        JLabel l = new JLabel(text);
-
-        l.setFont(
-                new Font(
-                        "Segoe UI",
-                        bold ? Font.BOLD : Font.PLAIN,
-                        size
-                )
-        );
-
+        JLabel l = new JLabel(value);
+        l.setFont(new Font(
+                "Segoe UI",
+                bold ? Font.BOLD : Font.PLAIN,
+                size
+        ));
         l.setForeground(color);
-
         return l;
     }
 
-    private static JButton button(String title) {
+    private JButton button(
+            String title,
+            boolean primary,
+            Runnable action
+    ) {
         JButton b = new JButton(title);
-
+        b.setBackground(primary ? CYAN : SECOND);
+        b.setForeground(primary ? BG : FG);
         b.setFont(
                 new Font("Segoe UI", Font.BOLD, 12)
         );
-
         b.setFocusPainted(false);
-        b.setForeground(FG);
-        b.setBackground(new Color(51, 65, 85));
-
+        b.setBorder(
+                new EmptyBorder(11, 14, 11, 14)
+        );
+        b.setCursor(
+                Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        );
+        b.addActionListener(e -> action.run());
         return b;
     }
 
-    private static void setupText(JTextArea text) {
-        text.setFont(
-                new Font("Segoe UI", Font.PLAIN, 17)
-        );
+    private static class Rounded extends JPanel {
+        private final int r;
+        private final Color a, b;
 
-        text.setLineWrap(true);
-        text.setWrapStyleWord(true);
-        text.setEditable(false);
-        text.setBackground(CARD);
-        text.setForeground(FG);
-        text.setCaretColor(FG);
+        Rounded(int r, Color a, Color b) {
+            this.r = r;
+            this.a = a;
+            this.b = b;
+            setOpaque(false);
+        }
 
-        text.setBorder(
-                new EmptyBorder(8, 6, 8, 6)
-        );
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(
+                    RenderingHints.KEY_ANTIALIASING,
+                    RenderingHints.VALUE_ANTIALIAS_ON
+            );
+            g2.setPaint(new GradientPaint(
+                    0, 0, a,
+                    getWidth(), getHeight(), b
+            ));
+            g2.fillRoundRect(
+                    0, 0,
+                    getWidth(), getHeight(),
+                    r, r
+            );
+            g2.dispose();
+            super.paintComponent(g);
+        }
     }
 
-    private static JPanel textPanel(
-            String title,
-            JTextArea text
-    ) {
-        JPanel root = panel(CARD);
+    private void refreshTabs() {
+        long now = System.currentTimeMillis();
 
-        root.setBorder(
-                new EmptyBorder(10, 12, 10, 12)
-        );
+        List<Tab> available = tabs.values().stream()
+                .filter(t -> now - t.seen() < 10000)
+                .sorted(
+                        Comparator.comparing(Tab::title)
+                                .thenComparingLong(Tab::id)
+                )
+                .toList();
 
-        root.setLayout(new BorderLayout(0, 6));
+        boolean changed =
+                available.size() != targetBox.getItemCount();
 
-        root.add(
-                label(title, 13, true, SECONDARY),
-                BorderLayout.NORTH
-        );
+        if (!changed) {
+            for (int i = 0; i < available.size(); i++) {
+                Tab a = available.get(i);
+                Tab b = targetBox.getItemAt(i);
 
-        JScrollPane scroll = new JScrollPane(text);
+                if (a.id() != b.id() ||
+                        a.window() != b.window() ||
+                        !a.title().equals(b.title())) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
 
-        scroll.setBorder(null);
-        scroll.getViewport().setBackground(CARD);
+        if (!changed) return;
 
-        root.add(scroll, BorderLayout.CENTER);
+        long previous = selectedTab;
+        rebuildingTabs = true;
+        targetBox.removeAllItems();
 
-        return root;
+        int select = -1;
+
+        for (int i = 0; i < available.size(); i++) {
+            Tab t = available.get(i);
+            targetBox.addItem(t);
+            if (t.id() == previous) select = i;
+        }
+
+        if (select < 0 && !available.isEmpty()) {
+            select = 0;
+        }
+
+        targetBox.setSelectedIndex(select);
+
+        selectedTab = select < 0
+                ? -1
+                : available.get(select).id();
+
+        rebuildingTabs = false;
+
+        if (selectedTab >= 0 && pendingJob == -1) {
+            chromeStatus.setText(
+                    "Chrome подключён · выбрана вкладка ChatGPT"
+            );
+        }
+
+        if (available.isEmpty()) {
+            chromeStatus.setText(
+                    "Chrome не найден: открой ChatGPT и обнови страницу F5"
+            );
+        }
     }
 
-    private void startEventServer() {
+    private void startBrowserServer() {
         try {
-            socket = new DatagramSocket(
+            browserServer = HttpServer.create(
                     new InetSocketAddress(
                             "127.0.0.1",
-                            EVENT_PORT
+                            CHROME_PORT
+                    ),
+                    0
+            );
+
+            browserServer.createContext("/poll", x -> {
+                try {
+                    if (!browserAuthorized(x)) return;
+
+                    JsonNode data =
+                            JSON.readTree(x.getRequestBody());
+
+                    long tab = data.path("tabId").asLong(-1);
+                    long window = data.path("windowId").asLong(-1);
+
+                    String url = data.path("url").asText("");
+                    String title = data.path("title")
+                            .asText("ChatGPT");
+
+                    if (tab < 0 ||
+                            !(url.startsWith("https://chatgpt.com/") ||
+                                    url.startsWith("https://chat.openai.com/"))) {
+
+                        writeJson(
+                                x,
+                                400,
+                                JSON.createObjectNode()
+                        );
+                        return;
+                    }
+
+                    tabs.put(
+                            tab,
+                            new Tab(
+                                    tab,
+                                    window,
+                                    title,
+                                    System.currentTimeMillis()
+                            )
+                    );
+
+                    ObjectNode response =
+                            JSON.createObjectNode();
+
+                    BrowserJob job = browserJob;
+
+                    if (job != null && job.tabId() == tab) {
+                        synchronized (this) {
+                            if (browserJob == job) {
+                                browserJob = null;
+
+                                ObjectNode j =
+                                        response.putObject("job");
+
+                                j.put("id", job.id());
+                                j.put("text", job.text());
+                            }
+                        }
+                    }
+
+                    writeJson(x, 200, response);
+
+                } catch (Exception ignored) {
+                    safeError(x);
+                }
+            });
+
+            browserServer.createContext("/event", x -> {
+                try {
+                    if (!browserAuthorized(x)) return;
+
+                    JsonNode data =
+                            JSON.readTree(x.getRequestBody());
+
+                    long jobId =
+                            data.path("jobId").asLong(-1);
+
+                    long tab =
+                            data.path("tabId").asLong(-1);
+
+                    String kind =
+                            data.path("kind").asText("");
+
+                    String error =
+                            data.path("message").asText("");
+
+                    if (jobId == pendingJob && tab == pendingTab) {
+                        ui(() -> {
+                            if (kind.equals("sent")) {
+                                chromeStatus.setText(
+                                        "Запрос отправлен · ожидаю ответ..."
+                                );
+                            }
+
+                            if (kind.equals("error")) {
+                                chromeStatus.setText(
+                                        "Ошибка Chrome: " + error
+                                );
+                            }
+
+                            if (kind.equals("done")) {
+                                chromeStatus.setText(
+                                        "Ответ готов! Звуковой сигнал подан."
+                                );
+                                playSignal();
+                            }
+                        });
+
+                        if (kind.equals("done") ||
+                                kind.equals("error")) {
+
+                            pendingJob = -1;
+                            pendingTab = -1;
+                        }
+                    }
+
+                    writeJson(
+                            x,
+                            200,
+                            JSON.createObjectNode().put("ok", true)
+                    );
+
+                } catch (Exception ignored) {
+                    safeError(x);
+                }
+            });
+
+            browserServer.setExecutor(
+                    Executors.newCachedThreadPool(
+                            r -> daemon(r, "chrome-bridge")
                     )
             );
 
-            Thread listener = new Thread(() -> {
-                byte[] buf = new byte[2048];
+            browserServer.start();
+
+        } catch (IOException ex) {
+            chromeStatus.setText(
+                    "Не удалось открыть порт " +
+                            CHROME_PORT + ": " +
+                            ex.getMessage()
+            );
+        }
+    }
+
+    private boolean browserAuthorized(
+            HttpExchange x
+    ) throws IOException {
+
+        if (!"POST".equals(x.getRequestMethod()) ||
+                !"chrome-ext-v1".equals(
+                        x.getRequestHeaders()
+                                .getFirst("X-Snom-Bridge")
+                )) {
+
+            writeJson(
+                    x,
+                    403,
+                    JSON.createObjectNode()
+            );
+            return false;
+        }
+
+        return true;
+    }
+
+    private void writeJson(
+            HttpExchange x,
+            int code,
+            JsonNode obj
+    ) throws IOException {
+
+        byte[] bytes = JSON.writeValueAsBytes(obj);
+
+        x.getResponseHeaders().set(
+                "Content-Type",
+                "application/json; charset=UTF-8"
+        );
+
+        x.sendResponseHeaders(code, bytes.length);
+
+        try (var out = x.getResponseBody()) {
+            out.write(bytes);
+        }
+    }
+
+    private void safeError(HttpExchange x) {
+        try {
+            writeJson(
+                    x,
+                    500,
+                    JSON.createObjectNode()
+            );
+        } catch (IOException ignored) {
+        }
+    }
+
+    private void startPhoneServer() {
+        try {
+            snomServer = HttpServer.create(
+                    new InetSocketAddress(PC, PHONE_PORT),
+                    0
+            );
+
+            snomServer.createContext("/", x -> {
+                String remote = x.getRemoteAddress()
+                        .getAddress()
+                        .getHostAddress();
+
+                String path = x.getRequestURI().getPath();
+
+                String event = switch (path) {
+                    case "/offhook" -> "offhook";
+                    case "/outgoing", "/connected" -> "connected";
+                    case "/hangup", "/disconnected" -> "hangup";
+                    default -> "";
+                };
+
+                boolean allowed =
+                        (remote.equals(SNOM) || remote.equals(PC)) &&
+                                x.getRequestMethod().equals("GET");
+
+                int code = !allowed
+                        ? 403
+                        : event.isEmpty() ? 404 : 200;
+
+                byte[] body = (
+                        code == 200 ? "OK" : "Not found"
+                ).getBytes(StandardCharsets.UTF_8);
+
+                x.getResponseHeaders().set(
+                        "Content-Type",
+                        "text/plain; charset=utf-8"
+                );
+
+                x.sendResponseHeaders(code, body.length);
+
+                try (var out = x.getResponseBody()) {
+                    out.write(body);
+                }
+
+                if (code == 200) {
+                    phoneEvents.offer(event);
+                }
+            });
+
+            snomServer.setExecutor(
+                    Executors.newCachedThreadPool(
+                            r -> daemon(r, "snom-hooks")
+                    )
+            );
+
+            snomServer.start();
+
+            phoneDetail.setText(
+                    "Snom HTTP готов · " + PC + ":" + PHONE_PORT
+            );
+
+        } catch (IOException ex) {
+            phoneDetail.setText(
+                    "Snom HTTP не запустился: " +
+                            ex.getMessage()
+            );
+        }
+    }
+
+    private void startMicroSipServer() {
+        try {
+            sipSocket = new DatagramSocket(
+                    new InetSocketAddress(
+                            "127.0.0.1",
+                            MICROSIP_PORT
+                    )
+            );
+
+            daemon(() -> {
+                byte[] b = new byte[1024];
 
                 while (!closing) {
                     try {
                         DatagramPacket p =
-                                new DatagramPacket(
-                                        buf,
-                                        buf.length
-                                );
+                                new DatagramPacket(b, b.length);
 
-                        socket.receive(p);
+                        sipSocket.receive(p);
 
-                        String raw = new String(
+                        String msg = new String(
                                 p.getData(),
                                 p.getOffset(),
                                 p.getLength(),
                                 StandardCharsets.UTF_8
-                        );
-
-                        String[] parts = raw.split("\\|", 2);
-
-                        String name = parts[0]
+                        ).split("\\|", 2)[0]
                                 .trim()
                                 .toLowerCase(Locale.ROOT);
 
-                        String caller = parts.length > 1
-                                ? parts[1].trim()
-                                : "";
-
-                        if (name.equals("incoming") ||
-                                name.equals("connected") ||
-                                name.equals("ended")) {
-
-                            events.offer(
-                                    new PhoneEvent(name, caller)
-                            );
+                        if (msg.equals("connected")) {
+                            phoneEvents.offer("connected");
                         }
 
-                    } catch (Exception ex) {
-                        if (!closing) {
-                            ui(() -> audioStatus.setText(
-                                    "Ошибка событий: " +
-                                            ex.getMessage()
-                            ));
+                        if (msg.equals("ended")) {
+                            phoneEvents.offer("hangup");
                         }
+
+                    } catch (Exception ignored) {
                     }
                 }
 
-            }, "microsip-events");
-
-            listener.setDaemon(true);
-            listener.start();
+            }, "microsip-hooks").start();
 
         } catch (SocketException ex) {
-            showError(
-                    "UDP-порт " + EVENT_PORT +
-                            " занят. Закрой другую копию программы."
+            phoneDetail.setText(
+                    "MicroSIP: UDP 47621 занят, проверь другие запущенные копии"
             );
         }
     }
 
-    private void startSnomHookServer() {
-        try {
-            snomHookServer = new ServerSocket();
+    private void dial101() {
+        String user = httpUser.getText().trim();
+        String password = new String(httpPass.getPassword());
 
-            snomHookServer.bind(
-                    new InetSocketAddress(
-                            PC_IP,
-                            SNOM_HOOK_PORT
-                    )
-            );
+        dialExecutor.submit(() -> {
+            String query =
+                    "number=101&outgoing_uri=100%40192.168.50.1";
 
-            hookStatus.setText(
-                    "Snom: HTTP " +
-                            PC_IP + ":" + SNOM_HOOK_PORT + " готов"
-            );
+            String[] pages = {
+                    "command.htm",
+                    "index.htm"
+            };
 
-            Thread listener = new Thread(() -> {
-                while (!closing) {
-                    try (Socket client = snomHookServer.accept()) {
-                        client.setSoTimeout(2500);
+            for (String page : pages) {
+                try {
+                    URL url = URI.create(
+                            "http://" + SNOM + "/" +
+                                    page + "?" + query
+                    ).toURL();
 
-                        String remote = client.getInetAddress()
-                                .getHostAddress();
+                    HttpURLConnection conn =
+                            (HttpURLConnection) url.openConnection();
 
-                        boolean allowed =
-                                remote.equals(SNOM_IP) ||
-                                        remote.equals(PC_IP);
+                    conn.setConnectTimeout(3500);
+                    conn.setReadTimeout(3500);
+                    conn.setRequestMethod("GET");
 
-                        BufferedReader in = new BufferedReader(
-                                new InputStreamReader(
-                                        client.getInputStream(),
-                                        StandardCharsets.US_ASCII
-                                )
-                        );
+                    if (!user.isBlank()) {
+                        conn.setAuthenticator(new Authenticator() {
+                            @Override
+                            protected PasswordAuthentication
+                            getPasswordAuthentication() {
 
-                        String request = in.readLine();
-
-                        boolean hangup = request != null &&
-                                (
-                                        request.startsWith("GET /hangup ") ||
-                                                request.startsWith("GET /hangup?")
+                                return new PasswordAuthentication(
+                                        user,
+                                        password.toCharArray()
                                 );
-
-                        int code = !allowed
-                                ? 403
-                                : hangup ? 200 : 404;
-
-                        byte[] response = (
-                                code == 200 ? "OK" : "Not found"
-                        ).getBytes(StandardCharsets.UTF_8);
-
-                        String headers =
-                                "HTTP/1.1 " +
-                                        code + " " +
-                                        (code == 200 ? "OK" : "Error") +
-                                        "\r\nContent-Type: text/plain; charset=utf-8\r\n" +
-                                        "Content-Length: " + response.length +
-                                        "\r\nConnection: close\r\n\r\n";
-
-                        client.getOutputStream().write(
-                                headers.getBytes(
-                                        StandardCharsets.US_ASCII
-                                )
-                        );
-
-                        client.getOutputStream().write(response);
-                        client.getOutputStream().flush();
-
-                        if (code == 200) {
-                            events.offer(
-                                    new PhoneEvent(
-                                            "ended",
-                                            "Snom " + remote
-                                    )
-                            );
-
-                            ui(() -> hookStatus.setText(
-                                    "Snom: получен сигнал укладывания трубки"
-                            ));
-                        }
-
-                    } catch (Exception e) {
-                        if (!closing) {
-                            ui(() -> hookStatus.setText(
-                                    "Snom HTTP: " + e.getMessage()
-                            ));
-                        }
-                    }
-                }
-
-            }, "snom-hook");
-
-            listener.setDaemon(true);
-            listener.start();
-
-        } catch (IOException e) {
-            hookStatus.setText(
-                    "Snom HTTP недоступен: " + e.getMessage()
-            );
-        }
-    }
-
-    private void processEvents(Recognizer rec) {
-        PhoneEvent e;
-
-        while ((e = events.poll()) != null) {
-            PhoneEvent current = e;
-
-            ui(() -> eventStatus.setText(
-                    "Событие: " + current.name() +
-                            (current.caller().isBlank()
-                                    ? ""
-                                    : " · " + current.caller())
-            ));
-
-            switch (e.name()) {
-                case "incoming" -> {
-                    if (activeSession &&
-                            !testSession &&
-                            finishAt == 0) {
-
-                        stoppedDuration =
-                                System.nanoTime() - startedAt;
-
-                        finishCall(rec);
-                        rec.reset();
+                            }
+                        });
                     }
 
-                    ui(() -> {
-                        if (!connected) {
-                            status.setText(
-                                    "Входящий вызов на 101"
-                            );
-                        }
-                    });
-                }
+                    int code = conn.getResponseCode();
+                    conn.disconnect();
 
-                case "connected" -> beginCall(rec, false);
+                    if (code >= 200 && code < 400) {
+                        ui(() -> phoneDetail.setText(
+                                "Команда набора 101 отправлена · ждём SIP-соединение"
+                        ));
+                        return;
+                    }
 
-                case "test_start" -> beginCall(rec, true);
+                    if (code == 401 || code == 403) {
+                        ui(() -> phoneDetail.setText(
+                                "Snom требует HTTP-авторизацию. " +
+                                        "Укажи логин/пароль HTTP внизу."
+                        ));
+                        return;
+                    }
 
-                case "ended", "test_end" -> {
-                    if (activeSession) {
-                        connected = false;
+                    if (code != 404) {
+                        ui(() -> phoneDetail.setText(
+                                "Snom отказал в наборе: HTTP " + code
+                        ));
+                        return;
+                    }
 
-                        stoppedDuration =
-                                System.nanoTime() - startedAt;
-
-                        finishAt = System.nanoTime() +
-                                HANGUP_GRACE_NS;
-
-                        ui(() -> status.setText(
-                                "Завершение распознавания..."
+                } catch (Exception ex) {
+                    if (page.equals(pages[pages.length - 1])) {
+                        ui(() -> phoneDetail.setText(
+                                "Не удалось набрать 101: " +
+                                        ex.getMessage()
                         ));
                     }
                 }
-
-                default -> {
-                }
             }
-        }
+        });
     }
 
-    private void beginCall(
-            Recognizer rec,
-            boolean test
-    ) {
-        if (activeSession && finishAt == 0) {
+    private void queueBrowserJob(String text) {
+        if (text == null || text.isBlank()) {
+            chromeStatus.setText(
+                    "Нет готового текста для отправки"
+            );
             return;
         }
 
-        if (activeSession) {
-            finishCall(rec);
+        Tab target = tabs.get(selectedTab);
+
+        if (target == null ||
+                System.currentTimeMillis() -
+                        target.seen() > 10000) {
+
+            chromeStatus.setText(
+                    "Выбери вкладку ChatGPT из списка выше"
+            );
+            return;
         }
 
-        rec.reset();
-
-        TargetDataLine existing = audioLine;
-
-        if (existing != null) {
-            existing.flush();
-        }
-
-        activeSession = true;
-        testSession = test;
-        finishAt = 0;
-
-        connected = true;
-        startedAt = System.nanoTime();
-        stoppedDuration = 0;
-
-        recognized.setLength(0);
-
-        callFile = HISTORY.resolve(
-                STAMP.format(LocalDateTime.now()) +
-                        "_call.txt"
+        BrowserJob job = new BrowserJob(
+                jobSequence.getAndIncrement(),
+                target.id(),
+                text
         );
 
-        ui(() -> {
-            status.setText(
-                    test
-                            ? "Тестовое распознавание"
-                            : "● Разговор активен"
-            );
+        browserJob = job;
+        pendingJob = job.id();
+        pendingTab = job.tabId();
 
-            words.setText("");
-            preview.setText("Слушаю трубку...");
-            level.setValue(0);
-        });
-    }
-
-    private void finishCall(Recognizer rec) {
-        if (!activeSession) {
-            return;
-        }
-
-        addWords(rec.getFinalResult());
-
-        activeSession = false;
-        connected = false;
-        finishAt = 0;
-
-        String prompt = recognized.toString().trim();
-
-        String sessionId = callFile.getFileName()
-                .toString()
-                .replace("_call.txt", "");
-
-        boolean send = autoSend && !testSession;
-
-        ui(() -> {
-            lastPrompt = prompt;
-
-            preview.setText(" ");
-            level.setValue(0);
-            status.setText("Звонок завершён");
-
-            if (prompt.isEmpty()) {
-                apiStatus.setText(
-                        "Текст не распознан — отправка пропущена"
-                );
-                return;
-            }
-
-            copyClipboard(prompt, null);
-
-            if (send) {
-                sendToOpenAi(prompt, sessionId, false);
-            } else {
-                apiStatus.setText(
-                        "Текст скопирован. Автоотправка отключена."
-                );
-            }
-        });
+        chromeStatus.setText(
+                "Ожидаю отправку запроса во вкладку «" +
+                        target.title() + "»..."
+        );
     }
 
     private void capture() {
-        Path modelPath = Path.of("model");
-
-        if (!Files.isDirectory(modelPath.resolve("am"))) {
-            ui(() -> showError(
-                    "Модель Vosk не найдена. " +
-                            "Проверь папку model рядом с pom.xml."
+        if (!Files.isDirectory(Path.of("model/am"))) {
+            ui(() -> speechStatus.setText(
+                    "Модель Vosk не найдена: нужна папка model рядом с pom.xml"
             ));
             return;
         }
@@ -809,167 +983,266 @@ public class Main {
             LibVosk.setLogLevel(LogLevel.WARNINGS);
 
             try (
-                    Model model = new Model(
-                            modelPath.toString()
-                    );
-
+                    Model model = new Model("model");
                     Recognizer rec = new Recognizer(
-                            model, VOSK_RATE
+                            model, VOSK_HZ
                     )
             ) {
-                Capture c = openCable();
-                audioLine = c.line();
+                AudioIn ai = findCable();
 
-                try {
-                    c.line().start();
+                TargetDataLine line = ai.line();
+                inputLine = line;
 
-                    ui(() -> audioStatus.setText(
-                            "VB-CABLE подключён: " +
-                                    c.name() + " · " +
-                                    (int) c.format().getSampleRate() +
-                                    " Hz"
-                    ));
+                Resampler resampler = new Resampler(
+                        ai.format().getSampleRate(),
+                        ai.format().getChannels()
+                );
 
-                    Resampler resampler = new Resampler(
-                            c.format().getSampleRate(),
-                            c.format().getChannels()
-                    );
+                byte[] input = new byte[8192];
+                byte[] pcm = new byte[16384];
 
-                    byte[] input = new byte[8192];
-                    byte[] output = new byte[16384];
+                line.start();
 
-                    long nextPreview = 0;
-                    long nextVolume = 0;
+                long nextPreview = 0;
+                long nextMeter = 0;
 
-                    int frameBytes = c.format().getFrameSize();
+                ui(() -> speechStatus.setText(
+                        "Vosk готов · " +
+                                ai.name() + " · " +
+                                (int) ai.format().getSampleRate() +
+                                " Гц"
+                ));
 
-                    while (!closing) {
-                        processEvents(rec);
+                while (!closing) {
+                    String event;
 
-                        if (activeSession &&
-                                finishAt != 0 &&
-                                System.nanoTime() >= finishAt) {
+                    while ((event = phoneEvents.poll()) != null) {
 
-                            finishCall(rec);
-                            rec.reset();
-                            resampler.reset();
-                        }
+                        if (event.equals("offhook") ||
+                                event.equals("test") ||
+                                event.equals("connected")) {
 
-                        int available = c.line().available();
+                            if (!active) {
+                                if (System.nanoTime() -
+                                        lastHangupAt <
+                                        700_000_000L &&
+                                        !event.equals("offhook")) {
+                                    continue;
+                                }
 
-                        int count = Math.min(
-                                available,
-                                input.length
-                        );
+                                active = true;
+                                finishing = false;
+                                testSession = event.equals("test");
+                                callEstablished =
+                                        event.equals("connected");
 
-                        count -= count % frameBytes;
+                                warnedMissingCall = false;
+                                recording = true;
 
-                        if (count < frameBytes) {
-                            Thread.sleep(15);
-                            continue;
-                        }
+                                startNanos = System.nanoTime();
+                                frozenNanos = 0;
 
-                        int size = c.line().read(
-                                input, 0, count
-                        );
+                                spoken.setLength(0);
+                                rec.reset();
+                                resampler.reset();
+                                line.flush();
 
-                        if (size <= 0 || !activeSession) {
-                            continue;
-                        }
-
-                        long now = System.nanoTime();
-
-                        if (now >= nextVolume) {
-                            int value = volume(
-                                    input,
-                                    size,
-                                    c.format().getChannels()
-                            );
-
-                            ui(() -> level.setValue(value));
-
-                            nextVolume =
-                                    now + 100_000_000L;
-                        }
-
-                        int n = resampler.convert(
-                                input,
-                                size,
-                                output
-                        );
-
-                        if (n > 0) {
-                            if (rec.acceptWaveForm(output, n)) {
-                                addWords(rec.getResult());
-
-                                ui(() -> preview.setText(
-                                        "Слушаю..."
-                                ));
-
-                            } else if (now >= nextPreview) {
-                                String partial = value(
-                                        rec.getPartialResult(),
-                                        "partial"
+                                sessionFile = HISTORY.resolve(
+                                        FILE_STAMP.format(
+                                                LocalDateTime.now()
+                                        ) + "_call.txt"
                                 );
 
-                                ui(() -> preview.setText(
-                                        partial.isBlank()
-                                                ? "Слушаю..."
-                                                : "Слышу: " + partial
-                                ));
+                                ui(() -> {
+                                    transcript.setText("");
+                                    phoneStatus.setText(
+                                            "Трубка поднята · слушаю голос"
+                                    );
+                                    partial.setText("Слушаю...");
+                                });
 
-                                nextPreview =
-                                        now + 250_000_000L;
+                                if (event.equals("offhook")) {
+                                    ui(this::dial101);
+                                }
+
+                            } else if (event.equals("connected")) {
+                                callEstablished = true;
+
+                                ui(() -> phoneDetail.setText(
+                                        "Номер 101 ответил · можно говорить"
+                                ));
                             }
+
+                        } else if (
+                                event.equals("hangup") &&
+                                        active &&
+                                        !finishing
+                        ) {
+                            finishing = true;
+                            recording = false;
+
+                            frozenNanos =
+                                    System.nanoTime() - startNanos;
+
+                            finishAt =
+                                    System.nanoTime() +
+                                            FINISH_DELAY_NS;
+
+                            ui(() -> phoneStatus.setText(
+                                    "Трубка положена · сохраняю последнюю фразу"
+                            ));
                         }
                     }
 
-                } finally {
-                    c.line().stop();
-                    c.line().close();
+                    if (active &&
+                            finishing &&
+                            System.nanoTime() >= finishAt) {
+
+                        appendFinal(rec.getFinalResult());
+
+                        active = false;
+                        finishing = false;
+                        lastHangupAt = System.nanoTime();
+
+                        String result =
+                                spoken.toString().trim();
+
+                        ui(() -> {
+                            lastPrompt = result;
+                            meter.setValue(0);
+                            partial.setText(" ");
+
+                            phoneStatus.setText(
+                                    "Готово · ожидаю следующего звонка"
+                            );
+
+                            if (!result.isBlank()) {
+                                try {
+                                    Toolkit.getDefaultToolkit()
+                                            .getSystemClipboard()
+                                            .setContents(
+                                                    new StringSelection(result),
+                                                    null
+                                            );
+                                } catch (IllegalStateException ignored) {
+                                }
+
+                                if (autoSubmit && !testSession) {
+                                    queueBrowserJob(result);
+                                }
+
+                            } else {
+                                chromeStatus.setText(
+                                        "Нет распознанной речи. " +
+                                                "Проверь регистрацию 101 в miniSIPServer."
+                                );
+                            }
+                        });
+
+                        rec.reset();
+                        resampler.reset();
+                    }
+
+                    int n = Math.min(
+                            line.available(),
+                            input.length
+                    );
+
+                    n -= n % ai.format().getFrameSize();
+
+                    if (n < ai.format().getFrameSize()) {
+                        Thread.sleep(15);
+                        continue;
+                    }
+
+                    int got = line.read(input, 0, n);
+
+                    if (got <= 0 || !active) {
+                        continue;
+                    }
+
+                    long now = System.nanoTime();
+
+                    if (now >= nextMeter) {
+                        int value = audioLevel(
+                                input,
+                                got,
+                                ai.format().getChannels()
+                        );
+
+                        ui(() -> meter.setValue(value));
+
+                        nextMeter =
+                                now + 100_000_000L;
+                    }
+
+                    int converted = resampler.convert(
+                            input,
+                            got,
+                            pcm
+                    );
+
+                    if (converted <= 0) {
+                        continue;
+                    }
+
+                    if (rec.acceptWaveForm(pcm, converted)) {
+                        appendFinal(rec.getResult());
+
+                        ui(() -> partial.setText(
+                                "Слушаю..."
+                        ));
+
+                    } else if (now >= nextPreview) {
+                        String phrase = jsonText(
+                                rec.getPartialResult(),
+                                "partial"
+                        );
+
+                        ui(() -> partial.setText(
+                                phrase.isBlank()
+                                        ? "Слушаю..."
+                                        : "Слышу: " + phrase
+                        ));
+
+                        nextPreview =
+                                now + 250_000_000L;
+                    }
                 }
+
+                line.close();
             }
 
         } catch (Exception ex) {
             if (!closing) {
-                ui(() -> showError(
-                        "Ошибка захвата/распознавания: " +
+                ui(() -> speechStatus.setText(
+                        "Ошибка захвата звука: " +
                                 ex.getMessage()
                 ));
             }
         }
     }
 
-    private void addWords(String json) {
-        String text = value(json, "text");
+    private void appendFinal(String result) {
+        String phrase = jsonText(result, "text");
 
-        if (text.isBlank()) {
-            return;
+        if (phrase.isBlank()) return;
+
+        if (!spoken.isEmpty()) {
+            spoken.append(' ');
         }
 
-        if (!recognized.isEmpty()) {
-            recognized.append(' ');
-        }
-
-        recognized.append(text);
+        spoken.append(phrase);
 
         String line =
                 CLOCK.format(LocalDateTime.now()) +
-                        " | " + text;
+                        "   " + phrase;
 
         try {
             Files.createDirectories(HISTORY);
 
             Files.writeString(
-                    callFile,
-                    line + System.lineSeparator(),
-                    StandardCharsets.UTF_8,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.APPEND
-            );
-
-            Files.writeString(
-                    Path.of("transcript.txt"),
+                    sessionFile,
                     line + System.lineSeparator(),
                     StandardCharsets.UTF_8,
                     StandardOpenOption.CREATE,
@@ -977,27 +1250,27 @@ public class Main {
             );
 
         } catch (IOException ex) {
-            ui(() -> audioStatus.setText(
+            ui(() -> speechStatus.setText(
                     "Ошибка сохранения: " +
                             ex.getMessage()
             ));
         }
 
         ui(() -> {
-            words.append(line + "\n\n");
+            transcript.append(line + "\n\n");
 
-            words.setCaretPosition(
-                    words.getDocument().getLength()
+            transcript.setCaretPosition(
+                    transcript.getDocument().getLength()
             );
         });
     }
 
-    private static String value(
-            String json,
+    private static String jsonText(
+            String data,
             String key
     ) {
         try {
-            return JSON.readTree(json)
+            return JSON.readTree(data)
                     .path(key)
                     .asText("")
                     .trim();
@@ -1007,349 +1280,71 @@ public class Main {
         }
     }
 
-    private void sendToOpenAi(
-            String prompt,
-            String sessionId,
-            boolean manual
-    ) {
-        if (prompt == null || prompt.isBlank()) {
-            apiStatus.setText(
-                    "Нечего отправлять: текст пустой"
-            );
-            return;
-        }
-
-        if (apiKey == null || apiKey.isBlank()) {
-            apiStatus.setText(
-                    "Нужен OPENAI_API_KEY (отдельный API-ключ)"
-            );
-            return;
-        }
-
-        if (creditsExhausted && !manual) {
-            apiStatus.setText(
-                    "API: нет кредитов. Текст сохранён и скопирован; " +
-                            "автоотправка приостановлена."
-            );
-            return;
-        }
-
-        apiStatus.setText(
-                "Отправляю запрос в OpenAI..."
-        );
-
-        answer.append(
-                "\n[" +
-                        CLOCK.format(LocalDateTime.now()) +
-                        "] Запрос: " + prompt + "\n"
-        );
-
-        answer.setCaretPosition(
-                answer.getDocument().getLength()
-        );
-
-        apiWorker.execute(() -> {
-            try {
-                ObjectNode request =
-                        JSON.createObjectNode();
-
-                request.put("model", MODEL_NAME);
-
-                request.put(
-                        "instructions",
-                        "Ты полезный голосовой помощник. " +
-                                "Отвечай на русском языке, " +
-                                "чётко и по существу. " +
-                                "Текст пользователя получен " +
-                                "распознаванием речи. Понимай его по смыслу."
-                );
-
-                request.put("input", prompt);
-                request.put("store", false);
-                request.put("max_output_tokens", 1100);
-
-                HttpRequest httpRequest =
-                        HttpRequest.newBuilder(
-                                        URI.create(
-                                                "https://api.openai.com/v1/responses"
-                                        )
-                                )
-                                .header(
-                                        "Authorization",
-                                        "Bearer " + apiKey
-                                )
-                                .header(
-                                        "Content-Type",
-                                        "application/json"
-                                )
-                                .timeout(Duration.ofSeconds(90))
-                                .POST(
-                                        HttpRequest.BodyPublishers.ofString(
-                                                JSON.writeValueAsString(request),
-                                                StandardCharsets.UTF_8
-                                        )
-                                )
-                                .build();
-
-                HttpResponse<String> response =
-                        http.send(
-                                httpRequest,
-                                HttpResponse.BodyHandlers.ofString(
-                                        StandardCharsets.UTF_8
-                                )
-                        );
-
-                JsonNode root =
-                        JSON.readTree(response.body());
-
-                if (response.statusCode() / 100 != 2) {
-                    JsonNode error = root.path("error");
-
-                    String code = error.path("code")
-                            .asText("");
-
-                    String message = error.path("message")
-                            .asText(
-                                    "HTTP " + response.statusCode()
-                            );
-
-                    String lower =
-                            message.toLowerCase(Locale.ROOT);
-
-                    if (response.statusCode() == 429 &&
-                            (
-                                    code.contains("credit") ||
-                                            code.contains("quota") ||
-                                            lower.contains("no credits") ||
-                                            lower.contains("quota")
-                            )) {
-
-                        creditsExhausted = true;
-
-                        ui(() -> {
-                            apiStatus.setText(
-                                    "Нет кредитов OpenAI API. " +
-                                            "Текст сохранён и скопирован."
-                            );
-
-                            answer.append(
-                                    "\n[API: закончились кредиты.]\n"
-                            );
-                        });
-
-                        return;
-                    }
-
-                    throw new IOException(
-                            "HTTP " +
-                                    response.statusCode() +
-                                    ": " + message
-                    );
-                }
-
-                creditsExhausted = false;
-
-                StringBuilder out = new StringBuilder();
-
-                for (JsonNode item : root.path("output")) {
-                    if (!"message".equals(
-                            item.path("type").asText()
-                    )) {
-                        continue;
-                    }
-
-                    for (JsonNode piece : item.path("content")) {
-                        if ("output_text".equals(
-                                piece.path("type").asText()
-                        )) {
-                            if (!out.isEmpty()) {
-                                out.append('\n');
-                            }
-
-                            out.append(
-                                    piece.path("text").asText("")
-                            );
-                        }
-                    }
-                }
-
-                String result = out.toString().trim();
-
-                if (result.isEmpty()) {
-                    throw new IOException(
-                            "Модель не вернула текст. Статус: " +
-                                    root.path("status")
-                                            .asText("неизвестен")
-                    );
-                }
-
-                Files.createDirectories(HISTORY);
-
-                Files.writeString(
-                        HISTORY.resolve(
-                                sessionId + "_answer.txt"
-                        ),
-                        result,
-                        StandardCharsets.UTF_8,
-                        StandardOpenOption.CREATE,
-                        StandardOpenOption.TRUNCATE_EXISTING
-                );
-
-                ui(() -> {
-                    apiStatus.setText(
-                            "Ответ получен · " + MODEL_NAME
-                    );
-
-                    answer.append(
-                            "\nИИ: " + result + "\n\n"
-                    );
-
-                    answer.setCaretPosition(
-                            answer.getDocument().getLength()
-                    );
-                });
-
-            } catch (Exception ex) {
-                ui(() -> {
-                    apiStatus.setText(
-                            "Ошибка API: " +
-                                    ex.getMessage()
-                    );
-
-                    answer.append(
-                            "\n[Ошибка запроса: " +
-                                    ex.getMessage() +
-                                    "]\n"
-                    );
-                });
-            }
-        });
-    }
-
-    private void updateTimer() {
-        long nanos = connected
-                ? System.nanoTime() - startedAt
-                : stoppedDuration;
-
-        long seconds = Math.max(
-                0,
-                nanos / 1_000_000_000L
-        );
-
-        duration.setText(
-                String.format(
-                        Locale.ROOT,
-                        "%02d:%02d",
-                        seconds / 60,
-                        seconds % 60
-                )
-        );
-    }
-
-    private void copyClipboard(
-            String text,
-            String emptyMessage
-    ) {
-        if (text == null || text.isBlank()) {
-            if (emptyMessage != null) {
-                apiStatus.setText(emptyMessage);
-            }
-            return;
-        }
-
-        try {
-            Toolkit.getDefaultToolkit()
-                    .getSystemClipboard()
-                    .setContents(
-                            new StringSelection(text),
-                            null
-                    );
-
-            apiStatus.setText(
-                    "Текст скопирован в буфер обмена"
-            );
-
-        } catch (IllegalStateException ex) {
-            apiStatus.setText(
-                    "Буфер занят. Нажми «Копировать запрос» ещё раз."
-            );
-        }
-    }
-
-    private static Capture openCable()
+    private static AudioIn findCable()
             throws LineUnavailableException {
 
-        List<Mixer.Info> mixers = new ArrayList<>();
-
-        for (Mixer.Info info :
-                AudioSystem.getMixerInfo()) {
-
-            String name = info.getName()
-                    .toLowerCase(Locale.ROOT);
-
-            if (name.contains("cable output") ||
-                    name.contains("vb-audio virtual cable")) {
-
-                mixers.add(info);
-            }
-        }
-
-        AudioFormat[] options = {
+        AudioFormat[] formats = {
                 new AudioFormat(48000, 16, 2, true, false),
                 new AudioFormat(48000, 16, 1, true, false),
                 new AudioFormat(44100, 16, 2, true, false),
-                new AudioFormat(44100, 16, 1, true, false),
                 new AudioFormat(16000, 16, 1, true, false)
         };
 
-        for (Mixer.Info mixer : mixers) {
-            for (AudioFormat fmt : options) {
+        for (Mixer.Info mixer :
+                AudioSystem.getMixerInfo()) {
+
+            String name = mixer.getName()
+                    .toLowerCase(Locale.ROOT);
+
+            if (!name.contains("cable output") &&
+                    !name.contains("vb-audio virtual cable")) {
+                continue;
+            }
+
+            for (AudioFormat format : formats) {
                 try {
                     TargetDataLine line =
                             AudioSystem.getTargetDataLine(
-                                    fmt,
+                                    format,
                                     mixer
                             );
 
-                    line.open(fmt, 16384);
+                    line.open(format, 16384);
 
-                    return new Capture(
+                    return new AudioIn(
                             line,
-                            fmt,
+                            format,
                             mixer.getName()
                     );
 
-                } catch (
-                        LineUnavailableException |
-                        IllegalArgumentException ignored
-                ) {
+                } catch (Exception ignored) {
                 }
             }
         }
 
         throw new LineUnavailableException(
-                "Не найден CABLE Output (VB-Audio Virtual Cable)"
+                "Не найден CABLE Output в устройствах записи Windows"
         );
     }
 
-    private static int volume(
-            byte[] samples,
-            int bytes,
+    private static int audioLevel(
+            byte[] data,
+            int count,
             int channels
     ) {
-        double sum = 0;
+        double energy = 0;
         int frames = 0;
 
         for (int i = 0;
-             i + 2 * channels <= bytes;
-             i += 2 * channels) {
+             i + channels * 2 <= count;
+             i += channels * 2) {
 
-            int v = (short) (
-                    (samples[i] & 255) |
-                            (samples[i + 1] << 8)
+            int sample = (short) (
+                    (data[i] & 255) |
+                            (data[i + 1] << 8)
             );
 
-            sum += (double) v * v;
+            energy += (double) sample * sample;
             frames++;
         }
 
@@ -1357,21 +1352,20 @@ public class Main {
                 100,
                 (int) (
                         Math.sqrt(
-                                sum / Math.max(frames, 1)
+                                energy / Math.max(frames, 1)
                         ) / 110
                 )
         );
     }
 
-    private static final class Resampler {
+    private static class Resampler {
         private final int channels;
         private final double ratio;
-        private double remaining;
-        private double sum;
+        private double remaining, sum;
 
-        Resampler(float inputRate, int channels) {
+        Resampler(float rate, int channels) {
             this.channels = channels;
-            this.ratio = inputRate / VOSK_RATE;
+            this.ratio = rate / VOSK_HZ;
             reset();
         }
 
@@ -1381,46 +1375,46 @@ public class Main {
         }
 
         int convert(
-                byte[] src,
-                int count,
+                byte[] input,
+                int length,
                 byte[] out
         ) {
-            int pos = 0;
-            int frameBytes = channels * 2;
+            int position = 0;
+            int frame = channels * 2;
 
             for (int i = 0;
-                 i + frameBytes <= count;
-                 i += frameBytes) {
+                 i + frame <= length;
+                 i += frame) {
 
-                double sample = 0;
+                double value = 0;
 
-                for (int ch = 0;
-                     ch < channels;
-                     ch++) {
+                for (int channel = 0;
+                     channel < channels;
+                     channel++) {
 
-                    int x = i + ch * 2;
+                    int j = i + channel * 2;
 
-                    sample += (short) (
-                            (src[x] & 255) |
-                                    (src[x + 1] << 8)
+                    value += (short) (
+                            (input[j] & 255) |
+                                    (input[j + 1] << 8)
                     );
                 }
 
-                sample /= channels;
+                value /= channels;
                 double available = 1;
 
                 while (available > 1e-9) {
                     double part = Math.min(
-                            remaining,
-                            available
+                            available,
+                            remaining
                     );
 
-                    sum += sample * part;
+                    sum += value * part;
                     remaining -= part;
                     available -= part;
 
                     if (remaining < 1e-9) {
-                        int n = Math.max(
+                        int sample = Math.max(
                                 -32768,
                                 Math.min(
                                         32767,
@@ -1430,8 +1424,11 @@ public class Main {
                                 )
                         );
 
-                        out[pos++] = (byte) n;
-                        out[pos++] = (byte) (n >>> 8);
+                        out[position++] =
+                                (byte) sample;
+
+                        out[position++] =
+                                (byte) (sample >>> 8);
 
                         remaining = ratio;
                         sum = 0;
@@ -1439,46 +1436,92 @@ public class Main {
                 }
             }
 
-            return pos;
+            return position;
         }
     }
 
-    private void showError(String msg) {
-        JOptionPane.showMessageDialog(
-                frame,
-                msg,
-                "Snom Transcriber",
-                JOptionPane.ERROR_MESSAGE
-        );
+    private void playSignal() {
+        daemon(() -> {
+            AudioFormat format =
+                    new AudioFormat(
+                            44100, 16, 1, true, false
+                    );
+
+            try (
+                    SourceDataLine out =
+                            AudioSystem.getSourceDataLine(format)
+            ) {
+                out.open(format);
+                out.start();
+
+                for (int tone = 0; tone < 2; tone++) {
+                    int freq = tone == 0 ? 720 : 960;
+
+                    byte[] samples =
+                            new byte[17640];
+
+                    for (int i = 0;
+                         i < samples.length / 2;
+                         i++) {
+
+                        short s = (short) (
+                                Math.sin(
+                                        2 * Math.PI *
+                                                freq * i / 44100
+                                ) * 7500
+                        );
+
+                        samples[2 * i] =
+                                (byte) s;
+
+                        samples[2 * i + 1] =
+                                (byte) (s >>> 8);
+                    }
+
+                    out.write(
+                            samples,
+                            0,
+                            samples.length
+                    );
+                }
+
+                out.drain();
+
+            } catch (Exception ignored) {
+                Toolkit.getDefaultToolkit().beep();
+            }
+
+        }, "ready-signal").start();
     }
 
-    private static void ui(Runnable fn) {
-        SwingUtilities.invokeLater(fn);
-    }
-
-    private void close() {
+    private void shutdown() {
         closing = true;
 
-        if (socket != null) {
-            socket.close();
+        if (swingTimer != null) {
+            swingTimer.stop();
         }
 
-        if (snomHookServer != null) {
-            try {
-                snomHookServer.close();
-            } catch (IOException ignored) {
-            }
+        if (browserServer != null) {
+            browserServer.stop(0);
         }
 
-        if (audioLine != null) {
-            audioLine.close();
+        if (snomServer != null) {
+            snomServer.stop(0);
         }
 
-        if (timer != null) {
-            timer.stop();
+        if (sipSocket != null) {
+            sipSocket.close();
         }
 
-        apiWorker.shutdownNow();
+        if (inputLine != null) {
+            inputLine.close();
+        }
+
+        dialExecutor.shutdownNow();
         frame.dispose();
+    }
+
+    private static void ui(Runnable task) {
+        SwingUtilities.invokeLater(task);
     }
 }
