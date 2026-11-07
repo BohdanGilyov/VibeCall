@@ -17,9 +17,14 @@ import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.datatransfer.StringSelection;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.net.*;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -36,75 +41,84 @@ public class Main {
     private static final int PHONE_PORT = 47622;
     private static final int MICROSIP_PORT = 47621;
     private static final int CHROME_PORT = 47624;
+    private static final int WHISPER_PORT = 47630;
 
-    private static final float VOSK_HZ = 16000;
-    private static final long FINISH_DELAY_NS = 500_000_000L;
+    private static final int SAMPLE_RATE = 16000;
 
     private static final Path HISTORY = Path.of("transcripts");
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    private static final DateTimeFormatter FILE_STAMP =
+    private static final DateTimeFormatter STAMP =
             DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss_SSS");
 
     private static final DateTimeFormatter CLOCK =
             DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    private static final Color BG = new Color(10, 17, 29);
-    private static final Color CARD = new Color(22, 34, 52);
-    private static final Color SECOND = new Color(33, 49, 71);
-    private static final Color FG = new Color(242, 248, 255);
-    private static final Color MUTE = new Color(153, 172, 193);
-    private static final Color CYAN = new Color(80, 222, 192);
-    private static final Color BLUE = new Color(116, 181, 255);
+    private static final Color BG = new Color(11, 18, 31);
+    private static final Color CARD = new Color(23, 36, 55);
+    private static final Color SECOND = new Color(38, 56, 79);
+    private static final Color FG = new Color(243, 248, 255);
+    private static final Color MUTED = new Color(154, 173, 195);
+    private static final Color CYAN = new Color(81, 224, 197);
+    private static final Color BLUE = new Color(127, 182, 255);
 
     private final JFrame frame =
-            new JFrame("Snom AI Bridge 4.3");
+            new JFrame("Snom AI Bridge 5.0");
 
-    private final JLabel phoneStatus =
-            text("Готов · подними трубку", 19, true, FG);
+    private final JLabel status =
+            label("Готов · сними трубку", 18, true, FG);
 
-    private final JLabel phoneDetail =
-            text("Snom: подключение по 192.168.50.1:47622",
-                    12, false, MUTE);
+    private final JLabel phoneInfo =
+            label("Snom: запускаю HTTP-сервер", 12, false, MUTED);
 
-    private final JLabel speechStatus =
-            text("Загрузка Vosk...", 13, false, MUTE);
+    private final JLabel audioInfo =
+            label("Vosk: загрузка", 12, false, MUTED);
 
-    private final JLabel chromeStatus =
-            text("Ожидаю вкладку ChatGPT...", 13, false, MUTE);
+    private final JLabel asrInfo =
+            label("Whisper: ожидает звонок", 12, false, MUTED);
 
-    private final JLabel partial =
-            text("Здесь появятся распознаваемые слова",
-                    13, false, BLUE);
+    private final JLabel chromeInfo =
+            label("Chrome: ожидаю расширение", 12, false, MUTED);
 
-    private final JLabel clock =
-            text("00:00", 34, true, FG);
+    private final JLabel preview =
+            label("Слова появятся здесь", 13, false, BLUE);
 
-    private final JLabel chromeConnection =
-            text("Вкладок ChatGPT: 0", 12, false, MUTE);
+    private final JLabel timer =
+            label("00:00", 30, true, FG);
 
     private final JTextArea transcript = new JTextArea();
     private final JProgressBar meter = new JProgressBar(0, 100);
-    private final JComboBox<Tab> targetBox = new JComboBox<>();
+    private final JComboBox<Tab> target = new JComboBox<>();
 
     private final JCheckBox autoSend =
-            new JCheckBox("Автоотправка после звонка", true);
+            new JCheckBox("Отправлять после распознавания", true);
 
-    private final JToggleButton bridgeToggle =
-            new JToggleButton("ON · Телефон активен");
+    private final GreenToggle enabledButton = new GreenToggle();
 
     private final Preferences prefs =
             Preferences.userNodeForPackage(Main.class);
 
-    private volatile String signalMixerName =
-            prefs.get("signal_mixer", "");
+    private volatile String speakerName =
+            prefs.get("speaker", "");
 
-    private volatile int signalVolume =
-            Math.max(0, Math.min(100,
-                    prefs.getInt("signal_volume", 65)));
+    private volatile int volume =
+            Math.max(0, Math.min(100, prefs.getInt("volume", 70)));
 
-    private volatile String snomHttpUser = "";
-    private volatile String snomHttpPassword = "";
+    private volatile boolean useWhisper =
+            prefs.getBoolean("useWhisper", true);
+
+    private volatile String snomUser = "";
+    private volatile String snomPassword = "";
+
+    private volatile boolean enabled = true;
+    private volatile boolean closing;
+    private volatile boolean recording;
+    private volatile boolean autoSubmit = true;
+
+    private volatile long callStarted;
+    private volatile long frozenDuration;
+    private volatile String lastText = "";
+    private volatile TargetDataLine inputLine;
 
     private final BlockingQueue<String> phoneEvents =
             new LinkedBlockingQueue<>();
@@ -112,51 +126,56 @@ public class Main {
     private final ConcurrentMap<Long, Tab> tabs =
             new ConcurrentHashMap<>();
 
-    private final AtomicLong jobSequence = new AtomicLong(1);
+    private final AtomicLong ids = new AtomicLong(1);
+    private final AtomicLong generation = new AtomicLong();
 
-    private final ExecutorService dialExecutor =
+    private final ExecutorService speechWorker =
+            Executors.newSingleThreadExecutor(
+                    r -> daemon(r, "whisper-requests")
+            );
+
+    private final ExecutorService dialWorker =
             Executors.newSingleThreadExecutor(
                     r -> daemon(r, "snom-dial")
             );
 
-    private volatile BrowserJob browserJob;
+    private final HttpClient http = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(2))
+            .build();
+
+    private volatile BrowserJob queuedJob;
 
     private volatile long selectedTab = -1;
-    private volatile long pendingJob = -1;
+    private volatile long pendingId = -1;
     private volatile long pendingTab = -1;
-    private volatile long pendingSince = 0;
+    private volatile long pendingSince;
 
-    private volatile boolean closing;
-    private volatile boolean recording;
-    private volatile boolean bridgeEnabled = true;
-    private volatile boolean autoSubmit = true;
-
-    private volatile long startNanos;
-    private volatile long frozenNanos;
-
-    private volatile String lastPrompt = "";
-    private volatile TargetDataLine inputLine;
+    private boolean editingTabs;
 
     private boolean active;
     private boolean finishing;
-    private boolean testSession;
-    private volatile boolean callEstablished;
+    private boolean testCall;
+    private boolean sipConnected;
 
     private long finishAt;
-    private long lastHangupAt;
-    private Path sessionFile;
+    private long lastStopAt;
+
+    private Path wavPath;
+    private WaveWriter wav;
 
     private final StringBuilder spoken = new StringBuilder();
 
-    private boolean rebuildingTabs;
-    private boolean warnedMissingCall;
-
-    private HttpServer browserServer;
-    private HttpServer snomServer;
+    private HttpServer phoneServer;
+    private HttpServer chromeServer;
     private DatagramSocket sipSocket;
-    private javax.swing.Timer swingTimer;
+    private javax.swing.Timer uiTimer;
 
-    private record Tab(long id, long window, String title, long seen) {
+    private record Tab(
+            long id,
+            long window,
+            String title,
+            long updated
+    ) {
         @Override
         public String toString() {
             return title + " · окно " + window;
@@ -169,14 +188,196 @@ public class Main {
             String text
     ) {}
 
-    private record AudioIn(
+    private record Capture(
             TargetDataLine line,
             AudioFormat format,
             String name
     ) {}
 
+    private record OutputDevice(
+            String name,
+            Mixer.Info info
+    ) {
+        @Override
+        public String toString() {
+            return name;
+        }
+    }
+
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> new Main().start());
+    }
+
+    private static Thread daemon(Runnable task, String name) {
+        Thread t = new Thread(task, name);
+        t.setDaemon(true);
+        return t;
+    }
+
+    private static JPanel clearPanel() {
+        JPanel p = new JPanel();
+        p.setOpaque(false);
+        return p;
+    }
+
+    private static JLabel label(
+            String s,
+            int size,
+            boolean bold,
+            Color color
+    ) {
+        JLabel l = new JLabel(s);
+
+        l.setFont(
+                new Font(
+                        "Segoe UI",
+                        bold ? Font.BOLD : Font.PLAIN,
+                        size
+                )
+        );
+
+        l.setForeground(color);
+        return l;
+    }
+
+    private static void ui(Runnable r) {
+        SwingUtilities.invokeLater(r);
+    }
+
+    private static class Card extends JPanel {
+
+        private final Color a;
+        private final Color b;
+
+        Card(Color a, Color b) {
+            this.a = a;
+            this.b = b;
+            setOpaque(false);
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D x = (Graphics2D) g.create();
+
+            x.setRenderingHint(
+                    RenderingHints.KEY_ANTIALIASING,
+                    RenderingHints.VALUE_ANTIALIAS_ON
+            );
+
+            x.setPaint(
+                    new GradientPaint(
+                            0,
+                            0,
+                            a,
+                            getWidth(),
+                            getHeight(),
+                            b
+                    )
+            );
+
+            x.fillRoundRect(
+                    0,
+                    0,
+                    getWidth(),
+                    getHeight(),
+                    20,
+                    20
+            );
+
+            x.dispose();
+            super.paintComponent(g);
+        }
+    }
+
+    private static class GreenToggle extends JToggleButton {
+
+        GreenToggle() {
+            super("ON · Телефон активен");
+
+            setSelected(true);
+            setContentAreaFilled(false);
+            setBorderPainted(false);
+            setFocusPainted(false);
+
+            setPreferredSize(new Dimension(215, 43));
+
+            setFont(
+                    new Font("Segoe UI", Font.BOLD, 13)
+            );
+
+            setCursor(
+                    Cursor.getPredefinedCursor(
+                            Cursor.HAND_CURSOR
+                    )
+            );
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D x = (Graphics2D) g.create();
+
+            x.setRenderingHint(
+                    RenderingHints.KEY_ANTIALIASING,
+                    RenderingHints.VALUE_ANTIALIAS_ON
+            );
+
+            Color color = isSelected()
+                    ? new Color(18, 158, 79)
+                    : new Color(178, 45, 55);
+
+            if (getModel().isPressed()) {
+                color = color.darker();
+            }
+
+            x.setColor(color);
+
+            x.fillRoundRect(
+                    0,
+                    0,
+                    getWidth(),
+                    getHeight(),
+                    14,
+                    14
+            );
+
+            x.setFont(getFont());
+            x.setColor(Color.WHITE);
+
+            FontMetrics m = x.getFontMetrics();
+
+            x.drawString(
+                    getText(),
+                    Math.max(
+                            5,
+                            (getWidth() -
+                                    m.stringWidth(getText())) / 2
+                    ),
+                    (getHeight() - m.getHeight()) / 2
+                            + m.getAscent()
+            );
+
+            x.dispose();
+        }
+    }
+
+    private JButton button(String s, Runnable action) {
+        JButton b = new JButton(s);
+
+        b.setBackground(SECOND);
+        b.setForeground(FG);
+        b.setFocusPainted(false);
+
+        b.setFont(
+                new Font("Segoe UI", Font.BOLD, 12)
+        );
+
+        b.setBorder(
+                new EmptyBorder(10, 12, 10, 12)
+        );
+
+        b.addActionListener(e -> action.run());
+
+        return b;
     }
 
     private void start() {
@@ -184,258 +385,288 @@ public class Main {
                 WindowConstants.DO_NOTHING_ON_CLOSE
         );
 
-        frame.setSize(1040, 770);
-        frame.setMinimumSize(new Dimension(850, 630));
+        frame.setSize(1050, 780);
+        frame.setMinimumSize(new Dimension(820, 620));
         frame.setLocationRelativeTo(null);
 
         frame.getContentPane().setBackground(BG);
-        frame.setLayout(new BorderLayout(0, 14));
+        frame.setLayout(new BorderLayout(0, 12));
 
-        Rounded hero = new Rounded(
-                22,
-                new Color(23, 64, 84),
-                new Color(23, 46, 93)
+        Card header = new Card(
+                new Color(20, 70, 79),
+                new Color(30, 49, 101)
         );
 
-        hero.setBorder(new EmptyBorder(22, 26, 20, 26));
-        hero.setLayout(new BorderLayout());
-
-        JPanel heroLeft = transparent();
-        heroLeft.setLayout(
-                new BoxLayout(heroLeft, BoxLayout.Y_AXIS)
+        header.setBorder(
+                new EmptyBorder(21, 24, 20, 24)
         );
 
-        heroLeft.add(text(
-                "S N O M / A I  B R I D G E  4.3",
-                12, true, CYAN
-        ));
+        header.setLayout(new BorderLayout());
 
-        heroLeft.add(Box.createVerticalStrut(12));
+        JPanel titleBox = clearPanel();
 
-        heroLeft.add(text(
-                "Твой голос. Твой ChatGPT.",
-                27, true, FG
-        ));
-
-        heroLeft.add(Box.createVerticalStrut(9));
-
-        heroLeft.add(text(
-                "Сними трубку → диктуй → положи → получи сигнал",
-                13, false, FG
-        ));
-
-        hero.add(heroLeft, BorderLayout.CENTER);
-
-        JPanel heroRight = transparent();
-        heroRight.setLayout(
-                new BoxLayout(heroRight, BoxLayout.Y_AXIS)
+        titleBox.setLayout(
+                new BoxLayout(titleBox, BoxLayout.Y_AXIS)
         );
 
-        clock.setAlignmentX(Component.RIGHT_ALIGNMENT);
-        phoneStatus.setAlignmentX(Component.RIGHT_ALIGNMENT);
+        titleBox.add(
+                label(
+                        "S N O M   /   A I   B R I D G E   5.0",
+                        12,
+                        true,
+                        CYAN
+                )
+        );
 
-        heroRight.add(clock);
-        heroRight.add(Box.createVerticalStrut(8));
-        heroRight.add(phoneStatus);
+        titleBox.add(Box.createVerticalStrut(10));
 
-        hero.add(heroRight, BorderLayout.EAST);
+        titleBox.add(
+                label(
+                        "Голос в ChatGPT",
+                        26,
+                        true,
+                        FG
+                )
+        );
 
-        JPanel north = transparent();
-        north.setBorder(new EmptyBorder(18, 22, 0, 22));
+        titleBox.add(Box.createVerticalStrut(8));
+
+        titleBox.add(
+                label(
+                        "Подними трубку → говори → положи → Whisper → ChatGPT",
+                        13,
+                        false,
+                        FG
+                )
+        );
+
+        header.add(titleBox, BorderLayout.WEST);
+
+        JPanel right = clearPanel();
+
+        right.setLayout(
+                new BoxLayout(right, BoxLayout.Y_AXIS)
+        );
+
+        timer.setAlignmentX(Component.RIGHT_ALIGNMENT);
+        status.setAlignmentX(Component.RIGHT_ALIGNMENT);
+
+        right.add(timer);
+        right.add(Box.createVerticalStrut(7));
+        right.add(status);
+
+        header.add(right, BorderLayout.EAST);
+
+        JPanel north = clearPanel();
+
+        north.setBorder(
+                new EmptyBorder(17, 20, 0, 20)
+        );
+
         north.setLayout(new BorderLayout());
-        north.add(hero);
+        north.add(header);
 
         frame.add(north, BorderLayout.NORTH);
 
-        JPanel middle = transparent();
-        middle.setBorder(new EmptyBorder(0, 22, 0, 22));
-        middle.setLayout(new BorderLayout(0, 12));
+        JPanel body = clearPanel();
 
-        Rounded statusCard = new Rounded(18, CARD, CARD);
-        statusCard.setBorder(new EmptyBorder(14, 18, 14, 18));
-        statusCard.setLayout(new GridLayout(4, 1, 0, 7));
+        body.setBorder(
+                new EmptyBorder(0, 20, 0, 20)
+        );
 
-        statusCard.add(phoneDetail);
-        statusCard.add(speechStatus);
-        statusCard.add(chromeConnection);
-        statusCard.add(chromeStatus);
+        body.setLayout(new BorderLayout(0, 12));
 
-        middle.add(statusCard, BorderLayout.NORTH);
+        Card info = new Card(CARD, CARD);
 
-        Rounded textCard = new Rounded(18, CARD, CARD);
-        textCard.setBorder(new EmptyBorder(14, 18, 14, 18));
-        textCard.setLayout(new BorderLayout(0, 10));
+        info.setLayout(new GridLayout(4, 1, 0, 6));
 
-        textCard.add(
-                text("РАСШИФРОВКА РАЗГОВОРА", 13, true, CYAN),
+        info.setBorder(
+                new EmptyBorder(12, 16, 12, 16)
+        );
+
+        info.add(phoneInfo);
+        info.add(audioInfo);
+        info.add(asrInfo);
+        info.add(chromeInfo);
+
+        body.add(info, BorderLayout.NORTH);
+
+        Card writing = new Card(CARD, CARD);
+
+        writing.setLayout(new BorderLayout(0, 8));
+
+        writing.setBorder(
+                new EmptyBorder(14, 17, 13, 17)
+        );
+
+        writing.add(
+                label(
+                        "РАСПОЗНАННАЯ РЕЧЬ",
+                        13,
+                        true,
+                        CYAN
+                ),
                 BorderLayout.NORTH
         );
 
-        transcript.setEditable(false);
-        transcript.setLineWrap(true);
-        transcript.setWrapStyleWord(true);
-
         transcript.setFont(
-                new Font("Segoe UI", Font.PLAIN, 17)
+                new Font("Segoe UI", Font.PLAIN, 16)
         );
 
-        transcript.setForeground(FG);
+        transcript.setLineWrap(true);
+        transcript.setWrapStyleWord(true);
+        transcript.setEditable(false);
+
         transcript.setBackground(CARD);
+        transcript.setForeground(FG);
         transcript.setCaretColor(FG);
 
         transcript.setText(
-                "Готово к работе. Сними трубку Snom 320 и говори.\n"
+                "Готов к диктовке. Сними трубку Snom 320.\n"
         );
 
         JScrollPane scroll = new JScrollPane(transcript);
+
         scroll.setBorder(null);
         scroll.getViewport().setBackground(CARD);
 
-        textCard.add(scroll, BorderLayout.CENTER);
+        writing.add(scroll, BorderLayout.CENTER);
+
+        JPanel bottomText = clearPanel();
+
+        bottomText.setLayout(new BorderLayout(0, 6));
 
         meter.setForeground(CYAN);
         meter.setBackground(SECOND);
         meter.setBorderPainted(false);
-        meter.setPreferredSize(new Dimension(200, 9));
 
-        JPanel speechFooter = transparent();
-        speechFooter.setLayout(new BorderLayout(0, 7));
+        bottomText.add(preview, BorderLayout.NORTH);
+        bottomText.add(meter, BorderLayout.SOUTH);
 
-        speechFooter.add(partial, BorderLayout.CENTER);
-        speechFooter.add(meter, BorderLayout.SOUTH);
+        writing.add(bottomText, BorderLayout.SOUTH);
 
-        textCard.add(speechFooter, BorderLayout.SOUTH);
+        body.add(writing, BorderLayout.CENTER);
+        frame.add(body, BorderLayout.CENTER);
 
-        middle.add(textCard, BorderLayout.CENTER);
-        frame.add(middle, BorderLayout.CENTER);
+        Card controls = new Card(CARD, CARD);
 
-        Rounded controls = new Rounded(18, CARD, CARD);
-        controls.setBorder(new EmptyBorder(15, 18, 17, 18));
         controls.setLayout(new BorderLayout(0, 12));
 
-        JPanel selectRow = transparent();
-        selectRow.setLayout(new BorderLayout(12, 0));
+        controls.setBorder(
+                new EmptyBorder(13, 16, 13, 16)
+        );
 
-        selectRow.add(
-                text("КУДА ОТПРАВЛЯТЬ", 12, true, MUTE),
+        JPanel select = clearPanel();
+
+        select.setLayout(new BorderLayout(12, 0));
+
+        select.add(
+                label(
+                        "ВКЛАДКА CHATGPT",
+                        12,
+                        true,
+                        MUTED
+                ),
                 BorderLayout.WEST
         );
 
-        targetBox.setFont(
-                new Font("Segoe UI", Font.PLAIN, 14)
+        target.setFont(
+                new Font("Segoe UI", Font.PLAIN, 13)
         );
 
-        targetBox.setBackground(SECOND);
-        targetBox.setForeground(FG);
+        target.addActionListener(e -> {
+            if (!editingTabs) {
+                Tab current =
+                        (Tab) target.getSelectedItem();
 
-        targetBox.addActionListener(e -> {
-            if (!rebuildingTabs) {
-                Tab t = (Tab) targetBox.getSelectedItem();
-
-                selectedTab = t == null
+                selectedTab = current == null
                         ? -1
-                        : t.id();
+                        : current.id();
             }
         });
 
-        selectRow.add(targetBox, BorderLayout.CENTER);
-        controls.add(selectRow, BorderLayout.NORTH);
+        select.add(target, BorderLayout.CENTER);
 
-        JPanel buttons = transparent();
-        buttons.setLayout(
-                new FlowLayout(FlowLayout.LEFT, 9, 0)
+        controls.add(select, BorderLayout.NORTH);
+
+        JPanel actions = clearPanel();
+
+        actions.setLayout(
+                new FlowLayout(FlowLayout.LEFT, 7, 0)
         );
 
-        buttons.add(button(
-                "Начать тест",
-                true,
-                () -> {
-                    if (bridgeEnabled) {
-                        phoneEvents.offer("test");
-                    } else {
-                        phoneStatus.setText("Сначала включи мост");
-                    }
-                }
+        actions.add(button(
+                "Тест записи",
+                () -> phoneEvents.offer("test")
         ));
 
-        buttons.add(button(
-                "Завершить",
-                false,
+        actions.add(button(
+                "Закончить",
                 () -> phoneEvents.offer("hangup")
         ));
 
-        buttons.add(button(
-                "Отправить текст",
-                false,
-                () -> queueBrowserJob(lastPrompt)
+        actions.add(button(
+                "Отправить ещё раз",
+                () -> queueBrowserJob(lastText)
         ));
 
-        buttons.add(button(
+        actions.add(button(
                 "Тест ChatGPT",
-                false,
                 () -> queueBrowserJob(
-                        "Проверка связи. Ответь одним коротким предложением."
+                        "Проверка связи. Ответь одним предложением."
                 )
         ));
 
-        buttons.add(button(
-                "Сбросить ожидание",
-                false,
-                this::resetBrowserJob
+        actions.add(button(
+                "Сброс ожидания",
+                this::resetPending
         ));
 
-        buttons.add(button(
+        actions.add(button(
                 "Настройки",
-                false,
                 this::openSettings
         ));
 
-        controls.add(buttons, BorderLayout.CENTER);
+        controls.add(actions, BorderLayout.CENTER);
 
-        JPanel preferences = transparent();
+        JPanel toggles = clearPanel();
 
-        preferences.setLayout(
-                new FlowLayout(FlowLayout.LEFT, 12, 0)
+        toggles.setLayout(
+                new FlowLayout(FlowLayout.LEFT, 13, 0)
         );
 
-        autoSend.setOpaque(false);
         autoSend.setForeground(FG);
+        autoSend.setOpaque(false);
 
-        autoSend.addActionListener(
-                e -> autoSubmit = autoSend.isSelected()
+        autoSend.addActionListener(e ->
+                autoSubmit = autoSend.isSelected()
         );
 
-        preferences.add(autoSend);
+        toggles.add(autoSend);
 
-        bridgeToggle.setSelected(true);
-        bridgeToggle.setFont(
-                new Font("Segoe UI", Font.BOLD, 14)
+        enabledButton.addActionListener(e ->
+                setEnabled(enabledButton.isSelected())
         );
 
-        bridgeToggle.setBackground(new Color(31, 110, 82));
-        bridgeToggle.setForeground(FG);
-        bridgeToggle.setFocusPainted(false);
+        toggles.add(enabledButton);
 
-        bridgeToggle.setBorder(
-                new EmptyBorder(10, 16, 10, 16)
-        );
-
-        bridgeToggle.addActionListener(e ->
-                setBridgeEnabled(bridgeToggle.isSelected())
-        );
-
-        preferences.add(bridgeToggle);
-
-        preferences.add(text(
-                "После запуска: ON",
-                11, false, MUTE
+        toggles.add(label(
+                "ON при запуске",
+                11,
+                false,
+                MUTED
         ));
 
-        controls.add(preferences, BorderLayout.SOUTH);
+        controls.add(toggles, BorderLayout.SOUTH);
 
-        JPanel south = transparent();
-        south.setBorder(new EmptyBorder(0, 22, 20, 22));
+        JPanel south = clearPanel();
+
         south.setLayout(new BorderLayout());
+
+        south.setBorder(
+                new EmptyBorder(0, 20, 17, 20)
+        );
+
         south.add(controls);
 
         frame.add(south, BorderLayout.SOUTH);
@@ -451,166 +682,90 @@ public class Main {
                 }
         );
 
-        swingTimer = new javax.swing.Timer(400, e -> {
-            long seconds = (
-                    recording
-                            ? System.nanoTime() - startNanos
-                            : frozenNanos
-            ) / 1_000_000_000L;
+        uiTimer = new javax.swing.Timer(400, e -> {
+            long nanos = recording
+                    ? System.nanoTime() - callStarted
+                    : frozenDuration;
 
-            clock.setText(
+            long sec = Math.max(
+                    0,
+                    nanos / 1_000_000_000L
+            );
+
+            timer.setText(
                     String.format(
                             Locale.ROOT,
                             "%02d:%02d",
-                            seconds / 60,
-                            seconds % 60
+                            sec / 60,
+                            sec % 60
                     )
             );
 
             refreshTabs();
 
             if (
-                    pendingJob != -1 &&
-                            pendingSince > 0 &&
-                            System.currentTimeMillis() - pendingSince > 630000
+                    pendingId != -1 &&
+                            System.currentTimeMillis() -
+                                    pendingSince > 630000
             ) {
-                resetBrowserJob();
+                resetPending();
 
-                chromeStatus.setText(
-                        "Превышено время ожидания ChatGPT"
-                );
-            }
-
-            if (
-                    recording &&
-                            !callEstablished &&
-                            !warnedMissingCall &&
-                            System.nanoTime() - startNanos > 5_000_000_000L
-            ) {
-                warnedMissingCall = true;
-
-                phoneDetail.setText(
-                        "Нет подтверждения от 101: проверь регистрацию MicroSIP"
+                chromeInfo.setText(
+                        "ChatGPT: превышено время ожидания ответа"
                 );
             }
         });
 
-        swingTimer.start();
+        uiTimer.start();
         frame.setVisible(true);
 
-        startBrowserServer();
         startPhoneServer();
-        startMicroSipServer();
+        startSipServer();
+        startChromeServer();
 
-        Thread audio = daemon(this::capture, "vosk-audio");
-        audio.start();
+        daemon(
+                this::capture,
+                "vosk-capture"
+        ).start();
     }
 
-    private static Thread daemon(Runnable task, String name) {
-        Thread t = new Thread(task, name);
-        t.setDaemon(true);
-        return t;
-    }
+    private void setEnabled(boolean value) {
+        enabled = value;
 
-    private static JPanel transparent() {
-        JPanel p = new JPanel();
-        p.setOpaque(false);
-        return p;
-    }
-
-    private static JLabel text(
-            String value,
-            int size,
-            boolean bold,
-            Color color
-    ) {
-        JLabel l = new JLabel(value);
-
-        l.setFont(
-                new Font(
-                        "Segoe UI",
-                        bold ? Font.BOLD : Font.PLAIN,
-                        size
-                )
+        enabledButton.setText(
+                value
+                        ? "ON · Телефон активен"
+                        : "OFF · Телефон отключён"
         );
 
-        l.setForeground(color);
-        return l;
-    }
+        enabledButton.repaint();
 
-    private JButton button(
-            String title,
-            boolean primary,
-            Runnable action
-    ) {
-        JButton b = new JButton(title);
-
-        b.setBackground(primary ? CYAN : SECOND);
-        b.setForeground(primary ? BG : FG);
-
-        b.setFont(
-                new Font("Segoe UI", Font.BOLD, 12)
+        status.setText(
+                value
+                        ? "Готов · сними трубку"
+                        : "Отключён · OFF"
         );
 
-        b.setFocusPainted(false);
+        phoneEvents.clear();
 
-        b.setBorder(
-                new EmptyBorder(11, 14, 11, 14)
-        );
+        if (!value) {
+            generation.incrementAndGet();
 
-        b.setCursor(
-                Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-        );
+            phoneEvents.offer("cancel");
+            resetPending();
 
-        b.addActionListener(e -> action.run());
-        return b;
-    }
-
-    private static class Rounded extends JPanel {
-        private final int r;
-        private final Color a;
-        private final Color b;
-
-        Rounded(int r, Color a, Color b) {
-            this.r = r;
-            this.a = a;
-            this.b = b;
-            setOpaque(false);
-        }
-
-        @Override
-        protected void paintComponent(Graphics g) {
-            Graphics2D g2 = (Graphics2D) g.create();
-
-            g2.setRenderingHint(
-                    RenderingHints.KEY_ANTIALIASING,
-                    RenderingHints.VALUE_ANTIALIAS_ON
+            chromeInfo.setText(
+                    "OFF: новая диктовка и отправка заблокированы"
             );
-
-            g2.setPaint(
-                    new GradientPaint(
-                            0, 0, a,
-                            getWidth(), getHeight(), b
-                    )
-            );
-
-            g2.fillRoundRect(
-                    0, 0,
-                    getWidth(), getHeight(),
-                    r, r
-            );
-
-            g2.dispose();
-            super.paintComponent(g);
         }
     }
 
     private void refreshTabs() {
         long now = System.currentTimeMillis();
 
-        List<Tab> available = tabs.values()
+        List<Tab> list = tabs.values()
                 .stream()
-                .filter(t -> now - t.seen() < 10000)
+                .filter(t -> now - t.updated() < 15000)
                 .sorted(
                         Comparator.comparing(Tab::title)
                                 .thenComparingLong(Tab::id)
@@ -618,12 +773,12 @@ public class Main {
                 .toList();
 
         boolean changed =
-                available.size() != targetBox.getItemCount();
+                list.size() != target.getItemCount();
 
         if (!changed) {
-            for (int i = 0; i < available.size(); i++) {
-                Tab a = available.get(i);
-                Tab b = targetBox.getItemAt(i);
+            for (int i = 0; i < list.size(); i++) {
+                Tab a = list.get(i);
+                Tab b = target.getItemAt(i);
 
                 if (
                         a.id() != b.id() ||
@@ -636,62 +791,197 @@ public class Main {
             }
         }
 
-        if (!changed) return;
+        if (!changed) {
+            return;
+        }
 
-        long previous = selectedTab;
+        long old = selectedTab;
+        editingTabs = true;
 
-        rebuildingTabs = true;
-        targetBox.removeAllItems();
+        target.removeAllItems();
 
-        int select = -1;
+        int index = -1;
 
-        for (int i = 0; i < available.size(); i++) {
-            Tab t = available.get(i);
-            targetBox.addItem(t);
+        for (int i = 0; i < list.size(); i++) {
+            target.addItem(list.get(i));
 
-            if (t.id() == previous) {
-                select = i;
+            if (list.get(i).id() == old) {
+                index = i;
             }
         }
 
-        if (select < 0 && !available.isEmpty()) {
-            select = 0;
+        if (index < 0 && !list.isEmpty()) {
+            index = 0;
         }
 
-        targetBox.setSelectedIndex(select);
+        target.setSelectedIndex(index);
 
-        selectedTab = select < 0
+        selectedTab = index < 0
                 ? -1
-                : available.get(select).id();
+                : list.get(index).id();
 
-        rebuildingTabs = false;
+        editingTabs = false;
 
-        chromeConnection.setText(
-                available.isEmpty()
-                        ? "Chrome: вкладки не обнаружены · обнови ChatGPT (F5)"
-                        : "Chrome: подключено вкладок " + available.size()
-        );
+        if (list.isEmpty() && pendingId == -1) {
+            chromeInfo.setText(
+                    "Chrome: открой ChatGPT и обнови F5"
+            );
+
+        } else if (!list.isEmpty() && pendingId == -1) {
+            chromeInfo.setText(
+                    "Chrome: подключено вкладок " + list.size()
+            );
+        }
     }
 
-    private void startBrowserServer() {
+    private void startPhoneServer() {
         try {
-            browserServer = HttpServer.create(
-                    new InetSocketAddress("127.0.0.1", CHROME_PORT),
+            phoneServer = HttpServer.create(
+                    new InetSocketAddress(PC, PHONE_PORT),
                     0
             );
 
-            browserServer.createContext("/poll", x -> {
-                try {
-                    if (!browserAuthorized(x)) return;
+            phoneServer.createContext("/", x -> {
+                String remote = x.getRemoteAddress()
+                        .getAddress()
+                        .getHostAddress();
 
+                String path =
+                        x.getRequestURI().getPath();
+
+                String ev = switch (path) {
+                    case "/offhook" -> "offhook";
+
+                    case "/connected", "/outgoing" ->
+                            "connected";
+
+                    case "/hangup", "/disconnected" ->
+                            "hangup";
+
+                    default -> "";
+                };
+
+                int code =
+                        !"GET".equals(x.getRequestMethod()) ||
+                                !(
+                                        remote.equals(SNOM) ||
+                                                remote.equals(PC)
+                                )
+                                ? 403
+                                : ev.isEmpty() ? 404 : 200;
+
+                byte[] body = (
+                        code == 200 ? "OK" : "Not found"
+                ).getBytes(StandardCharsets.UTF_8);
+
+                x.sendResponseHeaders(code, body.length);
+
+                try (var out = x.getResponseBody()) {
+                    out.write(body);
+                }
+
+                if (code == 200 && enabled) {
+                    phoneEvents.offer(ev);
+                }
+            });
+
+            phoneServer.setExecutor(
+                    Executors.newCachedThreadPool(
+                            r -> daemon(r, "snom-http")
+                    )
+            );
+
+            phoneServer.start();
+
+            phoneInfo.setText(
+                    "Snom HTTP: " +
+                            PC + ":" + PHONE_PORT + " готов"
+            );
+
+        } catch (IOException ex) {
+            phoneInfo.setText(
+                    "Snom: ошибка HTTP: " + ex.getMessage()
+            );
+        }
+    }
+
+    private void startSipServer() {
+        try {
+            sipSocket = new DatagramSocket(
+                    new InetSocketAddress(
+                            "127.0.0.1",
+                            MICROSIP_PORT
+                    )
+            );
+
+            daemon(() -> {
+                byte[] buffer = new byte[1024];
+
+                while (!closing) {
+                    try {
+                        DatagramPacket packet =
+                                new DatagramPacket(
+                                        buffer,
+                                        buffer.length
+                                );
+
+                        sipSocket.receive(packet);
+
+                        String ev = new String(
+                                packet.getData(),
+                                packet.getOffset(),
+                                packet.getLength(),
+                                StandardCharsets.UTF_8
+                        ).split("\\|", 2)[0]
+                                .trim()
+                                .toLowerCase(Locale.ROOT);
+
+                        if (enabled && ev.equals("connected")) {
+                            phoneEvents.offer("connected");
+                        }
+
+                        if (enabled && ev.equals("ended")) {
+                            phoneEvents.offer("hangup");
+                        }
+
+                    } catch (Exception ignored) {
+                    }
+                }
+            }, "sip-events").start();
+
+        } catch (SocketException ex) {
+            phoneInfo.setText(
+                    "MicroSIP UDP " +
+                            MICROSIP_PORT + " занят"
+            );
+        }
+    }
+
+    private void startChromeServer() {
+        try {
+            chromeServer = HttpServer.create(
+                    new InetSocketAddress(
+                            "127.0.0.1",
+                            CHROME_PORT
+                    ),
+                    0
+            );
+
+            chromeServer.createContext("/poll", x -> {
+                if (!chromeAuthorized(x)) {
+                    return;
+                }
+
+                try {
                     JsonNode data =
                             JSON.readTree(x.getRequestBody());
 
                     long tab = data.path("tabId").asLong(-1);
-                    long window = data.path("windowId").asLong(-1);
+                    long window =
+                            data.path("windowId").asLong(-1);
 
-                    String url = data.path("url").asText("");
-                    String title = data.path("title").asText("ChatGPT");
+                    String url =
+                            data.path("url").asText("");
 
                     if (
                             tab < 0 ||
@@ -700,10 +990,11 @@ public class Main {
                                                     url.startsWith("https://chat.openai.com/")
                                     )
                     ) {
-                        writeJson(
-                                x, 400, JSON.createObjectNode()
+                        respond(
+                                x,
+                                400,
+                                JSON.createObjectNode()
                         );
-
                         return;
                     }
 
@@ -712,7 +1003,8 @@ public class Main {
                             new Tab(
                                     tab,
                                     window,
-                                    title,
+                                    data.path("title")
+                                            .asText("ChatGPT"),
                                     System.currentTimeMillis()
                             )
                     );
@@ -720,21 +1012,17 @@ public class Main {
                     ObjectNode response =
                             JSON.createObjectNode();
 
-                    BrowserJob job = browserJob;
-
-                    boolean busy = "true".equals(
-                            data.path("busy").asText("false")
-                    );
+                    BrowserJob job = queuedJob;
 
                     if (
-                            job != null &&
+                            enabled &&
+                                    job != null &&
                                     job.tabId() == tab &&
-                                    !busy &&
-                                    bridgeEnabled
+                                    !data.path("busy").asBoolean(false)
                     ) {
                         synchronized (this) {
-                            if (browserJob == job) {
-                                browserJob = null;
+                            if (queuedJob == job) {
+                                queuedJob = null;
 
                                 ObjectNode j =
                                         response.putObject("job");
@@ -745,102 +1033,100 @@ public class Main {
                         }
                     }
 
-                    writeJson(x, 200, response);
+                    respond(x, 200, response);
 
-                } catch (Exception ignored) {
+                } catch (Exception ex) {
                     safeError(x);
                 }
             });
 
-            browserServer.createContext("/event", x -> {
-                try {
-                    if (!browserAuthorized(x)) return;
+            chromeServer.createContext("/event", x -> {
+                if (!chromeAuthorized(x)) {
+                    return;
+                }
 
-                    JsonNode data =
+                try {
+                    JsonNode d =
                             JSON.readTree(x.getRequestBody());
 
-                    long jobId =
-                            data.path("jobId").asLong(-1);
-
-                    long tab =
-                            data.path("tabId").asLong(-1);
+                    long id = d.path("jobId").asLong(-1);
+                    long tab = d.path("tabId").asLong(-1);
 
                     String kind =
-                            data.path("kind").asText("");
+                            d.path("kind").asText("");
 
-                    String detail =
-                            data.path("message").asText("");
+                    String message =
+                            d.path("message").asText("");
 
                     if (
-                            jobId == pendingJob &&
+                            id == pendingId &&
                                     tab == pendingTab
                     ) {
                         if (
                                 kind.equals("done") ||
                                         kind.equals("error")
                         ) {
-                            pendingJob = -1;
+                            pendingId = -1;
                             pendingTab = -1;
                             pendingSince = 0;
                         }
 
                         ui(() -> {
-                            if (kind.equals("sent")) {
-                                chromeStatus.setText(
-                                        "Запрос отправлен · ожидаю ответ ChatGPT..."
-                                );
-                            }
+                            switch (kind) {
+                                case "sent" ->
+                                        chromeInfo.setText(
+                                                "ChatGPT: запрос отправлен"
+                                        );
 
-                            if (kind.equals("progress")) {
-                                chromeStatus.setText(
-                                        "ChatGPT: " + detail
-                                );
-                            }
+                                case "progress" ->
+                                        chromeInfo.setText(
+                                                "ChatGPT: " + message
+                                        );
 
-                            if (kind.equals("error")) {
-                                chromeStatus.setText(
-                                        "Ошибка Chrome: " + detail
-                                );
-                            }
+                                case "error" ->
+                                        chromeInfo.setText(
+                                                "Chrome: ошибка: " + message
+                                        );
 
-                            if (kind.equals("done")) {
-                                chromeStatus.setText(
-                                        "Ответ ChatGPT завершён · уведомление"
-                                );
+                                case "done" -> {
+                                    chromeInfo.setText(
+                                            "ChatGPT: ответ завершён"
+                                    );
 
-                                playSignal();
+                                    playSignal();
+                                }
                             }
                         });
                     }
 
-                    writeJson(
-                            x, 200,
-                            JSON.createObjectNode().put("ok", true)
+                    respond(
+                            x,
+                            200,
+                            JSON.createObjectNode()
+                                    .put("ok", true)
                     );
 
-                } catch (Exception ignored) {
+                } catch (Exception ex) {
                     safeError(x);
                 }
             });
 
-            browserServer.setExecutor(
+            chromeServer.setExecutor(
                     Executors.newCachedThreadPool(
-                            r -> daemon(r, "chrome-bridge")
+                            r -> daemon(r, "chrome-http")
                     )
             );
 
-            browserServer.start();
+            chromeServer.start();
 
         } catch (IOException ex) {
-            chromeStatus.setText(
-                    "Не удалось открыть порт " +
-                            CHROME_PORT + ": " +
-                            ex.getMessage()
+            chromeInfo.setText(
+                    "Chrome: порт занят: " + ex.getMessage()
             );
         }
     }
 
-    private boolean browserAuthorized(
+    private boolean chromeAuthorized(
             HttpExchange x
     ) throws IOException {
         if (
@@ -850,8 +1136,9 @@ public class Main {
                                         .getFirst("X-Snom-Bridge")
                         )
         ) {
-            writeJson(
-                    x, 403,
+            respond(
+                    x,
+                    403,
                     JSON.createObjectNode()
             );
 
@@ -861,16 +1148,17 @@ public class Main {
         return true;
     }
 
-    private void writeJson(
+    private static void respond(
             HttpExchange x,
             int code,
-            JsonNode obj
+            JsonNode data
     ) throws IOException {
-        byte[] bytes = JSON.writeValueAsBytes(obj);
+        byte[] bytes =
+                JSON.writeValueAsBytes(data);
 
         x.getResponseHeaders().set(
                 "Content-Type",
-                "application/json; charset=UTF-8"
+                "application/json; charset=utf-8"
         );
 
         x.sendResponseHeaders(code, bytes.length);
@@ -880,301 +1168,145 @@ public class Main {
         }
     }
 
-    private void safeError(HttpExchange x) {
+    private static void safeError(HttpExchange x) {
         try {
-            writeJson(
-                    x, 500, JSON.createObjectNode()
-            );
-        } catch (IOException ignored) {}
-    }
-
-    private void startPhoneServer() {
-        try {
-            snomServer = HttpServer.create(
-                    new InetSocketAddress(PC, PHONE_PORT),
-                    0
+            respond(
+                    x,
+                    500,
+                    JSON.createObjectNode()
             );
 
-            snomServer.createContext("/", x -> {
-                String remote =
-                        x.getRemoteAddress()
-                                .getAddress()
-                                .getHostAddress();
-
-                String path =
-                        x.getRequestURI().getPath();
-
-                String event = switch (path) {
-                    case "/offhook" -> "offhook";
-
-                    case "/outgoing", "/connected" ->
-                            "connected";
-
-                    case "/hangup", "/disconnected" ->
-                            "hangup";
-
-                    default -> "";
-                };
-
-                boolean allowed =
-                        (
-                                remote.equals(SNOM) ||
-                                        remote.equals(PC)
-                        ) &&
-                                x.getRequestMethod().equals("GET");
-
-                int code = !allowed
-                        ? 403
-                        : event.isEmpty() ? 404 : 200;
-
-                byte[] body = (
-                        code == 200 ? "OK" : "Not found"
-                ).getBytes(StandardCharsets.UTF_8);
-
-                x.getResponseHeaders().set(
-                        "Content-Type",
-                        "text/plain; charset=utf-8"
-                );
-
-                x.sendResponseHeaders(code, body.length);
-
-                try (var out = x.getResponseBody()) {
-                    out.write(body);
-                }
-
-                if (code == 200) {
-                    phoneEvents.offer(event);
-                }
-            });
-
-            snomServer.setExecutor(
-                    Executors.newCachedThreadPool(
-                            r -> daemon(r, "snom-hooks")
-                    )
-            );
-
-            snomServer.start();
-
-            phoneDetail.setText(
-                    "Snom HTTP готов · " +
-                            PC + ":" + PHONE_PORT
-            );
-
-        } catch (IOException ex) {
-            phoneDetail.setText(
-                    "Snom HTTP не запустился: " +
-                            ex.getMessage()
-            );
+        } catch (IOException ignored) {
         }
     }
 
-    private void startMicroSipServer() {
-        try {
-            sipSocket = new DatagramSocket(
-                    new InetSocketAddress(
-                            "127.0.0.1",
-                            MICROSIP_PORT
-                    )
+    private void queueBrowserJob(String text) {
+        if (!enabled) {
+            chromeInfo.setText(
+                    "OFF: отправка заблокирована"
             );
-
-            daemon(() -> {
-                byte[] b = new byte[1024];
-
-                while (!closing) {
-                    try {
-                        DatagramPacket p =
-                                new DatagramPacket(b, b.length);
-
-                        sipSocket.receive(p);
-
-                        String msg = new String(
-                                p.getData(),
-                                p.getOffset(),
-                                p.getLength(),
-                                StandardCharsets.UTF_8
-                        ).split("\\|", 2)[0]
-                                .trim()
-                                .toLowerCase(Locale.ROOT);
-
-                        if (msg.equals("connected")) {
-                            phoneEvents.offer("connected");
-                        }
-
-                        if (msg.equals("ended")) {
-                            phoneEvents.offer("hangup");
-                        }
-
-                    } catch (Exception ignored) {}
-                }
-
-            }, "microsip-hooks").start();
-
-        } catch (SocketException ex) {
-            phoneDetail.setText(
-                    "MicroSIP: UDP 47621 занят, проверь другие запущенные копии"
-            );
-        }
-    }
-
-    private void dial101() {
-        String user = snomHttpUser;
-        String password = snomHttpPassword;
-
-        dialExecutor.submit(() -> {
-            if (!bridgeEnabled) return;
-
-            String query =
-                    "number=101&outgoing_uri=100%40192.168.50.1";
-
-            String[] pages = {
-                    "command.htm",
-                    "index.htm"
-            };
-
-            for (String page : pages) {
-                try {
-                    URL url = URI.create(
-                            "http://" + SNOM + "/" +
-                                    page + "?" + query
-                    ).toURL();
-
-                    HttpURLConnection conn =
-                            (HttpURLConnection) url.openConnection();
-
-                    conn.setConnectTimeout(3500);
-                    conn.setReadTimeout(3500);
-                    conn.setRequestMethod("GET");
-
-                    if (!user.isBlank()) {
-                        conn.setAuthenticator(new Authenticator() {
-                            @Override
-                            protected PasswordAuthentication
-                            getPasswordAuthentication() {
-                                return new PasswordAuthentication(
-                                        user,
-                                        password.toCharArray()
-                                );
-                            }
-                        });
-                    }
-
-                    int code = conn.getResponseCode();
-                    conn.disconnect();
-
-                    if (code >= 200 && code < 400) {
-                        ui(() -> phoneDetail.setText(
-                                "Команда набора 101 отправлена · ждём SIP-соединение"
-                        ));
-
-                        return;
-                    }
-
-                    if (code == 401 || code == 403) {
-                        ui(() -> phoneDetail.setText(
-                                "Snom требует HTTP-авторизацию · открой Настройки"
-                        ));
-
-                        return;
-                    }
-
-                    if (code != 404) {
-                        ui(() -> phoneDetail.setText(
-                                "Snom отказал в наборе: HTTP " + code
-                        ));
-
-                        return;
-                    }
-
-                } catch (Exception ex) {
-                    if (
-                            page.equals(pages[pages.length - 1])
-                    ) {
-                        ui(() -> phoneDetail.setText(
-                                "Не удалось набрать 101: " +
-                                        ex.getMessage()
-                        ));
-                    }
-                }
-            }
-        });
-    }
-
-    private void resetBrowserJob() {
-        browserJob = null;
-
-        pendingJob = -1;
-        pendingTab = -1;
-        pendingSince = 0;
-
-        chromeStatus.setText(
-                "Ожидание сброшено. Уже отправленный запрос не отменён."
-        );
-    }
-
-    private void queueBrowserJob(String value) {
-        if (!bridgeEnabled) {
-            chromeStatus.setText(
-                    "Мост выключен · отправка заблокирована"
-            );
-
             return;
         }
 
-        if (pendingJob != -1) {
-            chromeStatus.setText(
-                    "Предыдущий запрос ещё обрабатывается. " +
-                            "Для сброса нажми «Сбросить ожидание»."
+        if (pendingId != -1) {
+            chromeInfo.setText(
+                    "Предыдущий запрос ещё обрабатывается"
             );
-
             return;
         }
 
-        if (value == null || value.isBlank()) {
-            chromeStatus.setText(
-                    "Нет готового текста для отправки"
+        if (text == null || text.isBlank()) {
+            chromeInfo.setText(
+                    "Нет текста для отправки"
             );
-
             return;
         }
 
-        Tab target = tabs.get(selectedTab);
+        Tab tab = tabs.get(selectedTab);
 
         if (
-                target == null ||
+                tab == null ||
                         System.currentTimeMillis() -
-                                target.seen() > 10000
+                                tab.updated() > 15000
         ) {
-            chromeStatus.setText(
-                    "Выбери вкладку ChatGPT из списка выше"
+            chromeInfo.setText(
+                    "Выбери работающую вкладку ChatGPT"
             );
-
             return;
         }
 
         BrowserJob job = new BrowserJob(
-                jobSequence.getAndIncrement(),
-                target.id(),
-                value
+                ids.getAndIncrement(),
+                tab.id(),
+                text
         );
 
-        browserJob = job;
-
-        pendingJob = job.id();
-        pendingTab = job.tabId();
+        queuedJob = job;
+        pendingId = job.id();
+        pendingTab = tab.id();
         pendingSince = System.currentTimeMillis();
 
-        chromeStatus.setText(
-                "Ожидаю отправку запроса во вкладку «" +
-                        target.title() + "»..."
+        chromeInfo.setText(
+                "Chrome: отправляю готовый текст..."
         );
+    }
+
+    private void resetPending() {
+        queuedJob = null;
+        pendingId = -1;
+        pendingTab = -1;
+        pendingSince = 0;
+
+        chromeInfo.setText(
+                "Ожидание Java сброшено (уже отправленный запрос не отменён)"
+        );
+    }
+
+    private void dial101() {
+        if (!enabled) {
+            return;
+        }
+
+        String username = snomUser;
+        String password = snomPassword;
+
+        dialWorker.execute(() -> {
+            try {
+                if (!enabled) {
+                    return;
+                }
+
+                HttpClient client = HttpClient.newBuilder()
+                        .connectTimeout(Duration.ofSeconds(3))
+                        .authenticator(new Authenticator() {
+                            @Override
+                            protected PasswordAuthentication
+                            getPasswordAuthentication() {
+                                return new PasswordAuthentication(
+                                        username,
+                                        password.toCharArray()
+                                );
+                            }
+                        })
+                        .build();
+
+                URI uri = URI.create(
+                        "http://" + SNOM +
+                                "/index.htm?number=101&outgoing_uri=100%40192.168.50.1"
+                );
+
+                HttpRequest req = HttpRequest.newBuilder(uri)
+                        .timeout(Duration.ofSeconds(5))
+                        .GET()
+                        .build();
+
+                HttpResponse<Void> response = client.send(
+                        req,
+                        HttpResponse.BodyHandlers.discarding()
+                );
+
+                ui(() -> phoneInfo.setText(
+                        response.statusCode() < 400
+                                ? "Snom: команда набора 101 отправлена"
+                                : "Snom HTTP: " +
+                                response.statusCode() +
+                                " · проверь логин/пароль в настройках"
+                ));
+
+            } catch (Exception ex) {
+                ui(() -> phoneInfo.setText(
+                        "Набор 101 не удался: " +
+                                ex.getMessage()
+                ));
+            }
+        });
     }
 
     private void capture() {
         if (!Files.isDirectory(Path.of("model/am"))) {
-            ui(() -> speechStatus.setText(
-                    "Модель Vosk не найдена: нужна папка model рядом с pom.xml"
+            ui(() -> audioInfo.setText(
+                    "Нет модели Vosk в папке model"
             ));
-
             return;
         }
 
@@ -1183,324 +1315,316 @@ public class Main {
 
             try (
                     Model model = new Model("model");
-                    Recognizer rec = new Recognizer(model, VOSK_HZ)
+                    Recognizer recognizer =
+                            new Recognizer(model, SAMPLE_RATE)
             ) {
-                AudioIn ai = findCable();
+                Capture source = findCable();
 
-                TargetDataLine line = ai.line();
+                TargetDataLine line = source.line();
                 inputLine = line;
+                line.start();
 
-                Resampler resampler = new Resampler(
-                        ai.format().getSampleRate(),
-                        ai.format().getChannels()
+                Downsampler sampler = new Downsampler(
+                        source.format().getSampleRate(),
+                        source.format().getChannels()
                 );
 
                 byte[] input = new byte[8192];
                 byte[] pcm = new byte[16384];
 
-                line.start();
+                int frameSize =
+                        source.format().getFrameSize();
 
-                long nextPreview = 0;
-                long nextMeter = 0;
-
-                ui(() -> speechStatus.setText(
+                ui(() -> audioInfo.setText(
                         "Vosk готов · " +
-                                ai.name() + " · " +
-                                (int) ai.format().getSampleRate() +
+                                source.name() + " · " +
+                                (int) source.format().getSampleRate() +
                                 " Гц"
                 ));
 
-                while (!closing) {
-                    String event;
+                try {
+                    while (!closing) {
+                        String ev;
 
-                    if (!bridgeEnabled && active) {
-                        cancelDictation(rec, resampler);
-                    }
-
-                    while (
-                            (event = phoneEvents.poll()) != null
-                    ) {
-                        if (event.equals("cancel")) {
-                            if (active) {
-                                cancelDictation(rec, resampler);
+                        while (
+                                (ev = phoneEvents.poll()) != null
+                        ) {
+                            if (ev.equals("cancel")) {
+                                cancelCall(
+                                        recognizer,
+                                        sampler
+                                );
+                                continue;
                             }
 
+                            if (!enabled) {
+                                continue;
+                            }
+
+                            if (
+                                    ev.equals("offhook") ||
+                                            ev.equals("connected") ||
+                                            ev.equals("test")
+                            ) {
+                                if (
+                                        !active &&
+                                                (
+                                                        ev.equals("offhook") ||
+                                                                System.nanoTime() -
+                                                                        lastStopAt >
+                                                                        1_500_000_000L
+                                                )
+                                ) {
+                                    startCall(
+                                            recognizer,
+                                            sampler,
+                                            line,
+                                            ev.equals("test")
+                                    );
+
+                                    if (ev.equals("offhook")) {
+                                        dial101();
+                                    }
+
+                                } else if (
+                                        ev.equals("connected") &&
+                                                active
+                                ) {
+                                    sipConnected = true;
+
+                                    ui(() -> phoneInfo.setText(
+                                            "MicroSIP: вызов соединён"
+                                    ));
+                                }
+
+                            } else if (
+                                    ev.equals("hangup") &&
+                                            active &&
+                                            !finishing
+                            ) {
+                                finishing = true;
+                                recording = false;
+
+                                frozenDuration =
+                                        System.nanoTime() -
+                                                callStarted;
+
+                                finishAt =
+                                        System.nanoTime() +
+                                                500_000_000L;
+
+                                ui(() -> status.setText(
+                                        "Трубка положена · завершаю запись..."
+                                ));
+                            }
+                        }
+
+                        if (
+                                active &&
+                                        finishing &&
+                                        System.nanoTime() >= finishAt
+                        ) {
+                            finishCall(recognizer);
+
+                            sampler.reset();
+                            recognizer.reset();
+                        }
+
+                        int available = Math.min(
+                                line.available(),
+                                input.length
+                        );
+
+                        available -= available % frameSize;
+
+                        if (available < frameSize) {
+                            Thread.sleep(15);
                             continue;
                         }
 
-                        if (!bridgeEnabled) continue;
+                        int got = line.read(
+                                input,
+                                0,
+                                available
+                        );
 
-                        if (
-                                event.equals("offhook") ||
-                                        event.equals("test") ||
-                                        event.equals("connected")
-                        ) {
-                            if (!active) {
-                                if (
-                                        System.nanoTime() - lastHangupAt <
-                                                700_000_000L &&
-                                                !event.equals("offhook")
-                                ) {
-                                    continue;
-                                }
-
-                                active = true;
-                                finishing = false;
-
-                                testSession = event.equals("test");
-
-                                callEstablished =
-                                        event.equals("connected");
-
-                                warnedMissingCall = false;
-                                recording = true;
-
-                                startNanos = System.nanoTime();
-                                frozenNanos = 0;
-
-                                spoken.setLength(0);
-
-                                rec.reset();
-                                resampler.reset();
-                                line.flush();
-
-                                sessionFile = HISTORY.resolve(
-                                        FILE_STAMP.format(
-                                                LocalDateTime.now()
-                                        ) + "_call.txt"
-                                );
-
-                                ui(() -> {
-                                    transcript.setText("");
-
-                                    phoneStatus.setText(
-                                            "Трубка поднята · слушаю голос"
-                                    );
-
-                                    partial.setText("Слушаю...");
-                                });
-
-                                if (event.equals("offhook")) {
-                                    ui(this::dial101);
-                                }
-
-                            } else if (event.equals("connected")) {
-                                callEstablished = true;
-
-                                ui(() -> phoneDetail.setText(
-                                        "Номер 101 ответил · можно говорить"
-                                ));
-                            }
-
-                        } else if (
-                                event.equals("hangup") &&
-                                        active &&
-                                        !finishing
-                        ) {
-                            finishing = true;
-                            recording = false;
-
-                            frozenNanos =
-                                    System.nanoTime() - startNanos;
-
-                            finishAt =
-                                    System.nanoTime() +
-                                            FINISH_DELAY_NS;
-
-                            ui(() -> phoneStatus.setText(
-                                    "Трубка положена · сохраняю последнюю фразу"
-                            ));
+                        if (got <= 0 || !active) {
+                            continue;
                         }
-                    }
 
-                    if (
-                            active &&
-                                    finishing &&
-                                    System.nanoTime() >= finishAt
-                    ) {
-                        appendFinal(rec.getFinalResult());
-
-                        active = false;
-                        finishing = false;
-
-                        lastHangupAt = System.nanoTime();
-
-                        String result = spoken.toString().trim();
-
-                        ui(() -> {
-                            if (!bridgeEnabled) return;
-
-                            lastPrompt = result;
-
-                            meter.setValue(0);
-                            partial.setText(" ");
-
-                            phoneStatus.setText(
-                                    "Готово · ожидаю следующего звонка"
-                            );
-
-                            if (!result.isBlank()) {
-                                try {
-                                    Toolkit.getDefaultToolkit()
-                                            .getSystemClipboard()
-                                            .setContents(
-                                                    new StringSelection(result),
-                                                    null
-                                            );
-
-                                } catch (IllegalStateException ignored) {}
-
-                                if (autoSubmit && !testSession) {
-                                    queueBrowserJob(result);
-                                }
-
-                            } else {
-                                chromeStatus.setText(
-                                        "Нет распознанной речи. " +
-                                                "Проверь регистрацию 101 в miniSIPServer."
-                                );
-                            }
-                        });
-
-                        rec.reset();
-                        resampler.reset();
-                    }
-
-                    int n = Math.min(
-                            line.available(),
-                            input.length
-                    );
-
-                    n -= n % ai.format().getFrameSize();
-
-                    if (n < ai.format().getFrameSize()) {
-                        Thread.sleep(15);
-                        continue;
-                    }
-
-                    int got = line.read(input, 0, n);
-
-                    if (got <= 0 || !active) continue;
-
-                    long now = System.nanoTime();
-
-                    if (now >= nextMeter) {
-                        int value = audioLevel(
+                        int bytes = sampler.convert(
                                 input,
                                 got,
-                                ai.format().getChannels()
+                                pcm
                         );
 
-                        ui(() -> meter.setValue(value));
+                        if (bytes <= 0) {
+                            continue;
+                        }
 
-                        nextMeter =
-                                now + 100_000_000L;
+                        if (wav != null) {
+                            wav.write(pcm, 0, bytes);
+                        }
+
+                        if (
+                                recognizer.acceptWaveForm(
+                                        pcm,
+                                        bytes
+                                )
+                        ) {
+                            appendVosk(
+                                    recognizer.getResult()
+                            );
+
+                            ui(() -> preview.setText(
+                                    "Слушаю..."
+                            ));
+
+                        } else {
+                            String partial = field(
+                                    recognizer.getPartialResult(),
+                                    "partial"
+                            );
+
+                            ui(() -> preview.setText(
+                                    partial.isBlank()
+                                            ? "Слушаю..."
+                                            : "Слышу: " + partial
+                            ));
+                        }
+
+                        final int level =
+                                audioLevel(pcm, bytes);
+
+                        ui(() -> meter.setValue(level));
                     }
 
-                    int converted = resampler.convert(
-                            input,
-                            got,
-                            pcm
-                    );
-
-                    if (converted <= 0) continue;
-
-                    if (rec.acceptWaveForm(pcm, converted)) {
-                        appendFinal(rec.getResult());
-
-                        ui(() -> partial.setText("Слушаю..."));
-
-                    } else if (now >= nextPreview) {
-                        String phrase = jsonText(
-                                rec.getPartialResult(),
-                                "partial"
-                        );
-
-                        ui(() -> partial.setText(
-                                phrase.isBlank()
-                                        ? "Слушаю..."
-                                        : "Слышу: " + phrase
-                        ));
-
-                        nextPreview = now + 250_000_000L;
-                    }
+                } finally {
+                    line.close();
                 }
-
-                line.close();
             }
 
         } catch (Exception ex) {
             if (!closing) {
-                ui(() -> speechStatus.setText(
-                        "Ошибка захвата звука: " +
+                ui(() -> audioInfo.setText(
+                        "Ошибка Vosk/VB-CABLE: " +
                                 ex.getMessage()
                 ));
             }
         }
     }
 
-    private void cancelDictation(
+    private void startCall(
             Recognizer rec,
-            Resampler resampler
+            Downsampler sampler,
+            TargetDataLine line,
+            boolean test
     ) {
-        active = false;
-        finishing = false;
-        testSession = false;
-        recording = false;
-        callEstablished = false;
+        if (!enabled) {
+            return;
+        }
 
-        lastHangupAt = System.nanoTime();
+        active = true;
+        finishing = false;
+        testCall = test;
+        sipConnected = false;
+
+        recording = true;
+        callStarted = System.nanoTime();
+        frozenDuration = 0;
 
         spoken.setLength(0);
+
+        sampler.reset();
         rec.reset();
-        resampler.reset();
+        line.flush();
+
+        String name =
+                STAMP.format(LocalDateTime.now());
+
+        wavPath = HISTORY.resolve(name + ".wav");
+
+        try {
+            wav = new WaveWriter(wavPath);
+
+        } catch (IOException ex) {
+            wav = null;
+
+            ui(() -> asrInfo.setText(
+                    "Не удаётся записать WAV: " +
+                            ex.getMessage()
+            ));
+        }
 
         ui(() -> {
+            transcript.setText("");
             meter.setValue(0);
-            partial.setText(" ");
 
-            phoneStatus.setText(
-                    "Мост выключен · OFF"
+            status.setText(
+                    test
+                            ? "Тест диктовки"
+                            : "Трубка поднята · слушаю"
             );
 
-            chromeStatus.setText(
-                    "Диктовка отменена, отправки не будет"
+            preview.setText("Слушаю...");
+
+            asrInfo.setText(
+                    useWhisper
+                            ? "Whisper: запишу весь звонок для уточнения"
+                            : "Vosk: основной режим"
             );
         });
     }
 
-    private void appendFinal(String result) {
-        String phrase = jsonText(result, "text");
+    private void cancelCall(
+            Recognizer rec,
+            Downsampler sampler
+    ) {
+        active = false;
+        finishing = false;
+        recording = false;
+        sipConnected = false;
 
-        if (phrase.isBlank()) return;
+        lastStopAt = System.nanoTime();
+
+        spoken.setLength(0);
+
+        rec.reset();
+        sampler.reset();
+
+        if (wav != null) {
+            try {
+                wav.close();
+
+            } catch (IOException ignored) {
+            }
+        }
+
+        wav = null;
+
+        ui(() -> {
+            meter.setValue(0);
+            preview.setText(" ");
+            status.setText("Отключён · OFF");
+        });
+    }
+
+    private void appendVosk(String json) {
+        String text = field(json, "text");
+
+        if (text.isBlank()) {
+            return;
+        }
 
         if (!spoken.isEmpty()) {
             spoken.append(' ');
         }
 
-        spoken.append(phrase);
+        spoken.append(text);
 
         String line =
                 CLOCK.format(LocalDateTime.now()) +
-                        "   " + phrase;
-
-        try {
-            Files.createDirectories(HISTORY);
-
-            Files.writeString(
-                    sessionFile,
-                    line + System.lineSeparator(),
-                    StandardCharsets.UTF_8,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.APPEND
-            );
-
-        } catch (IOException ex) {
-            ui(() -> speechStatus.setText(
-                    "Ошибка сохранения: " +
-                            ex.getMessage()
-            ));
-        }
+                        " | " + text;
 
         ui(() -> {
             transcript.append(line + "\n\n");
@@ -1511,12 +1635,196 @@ public class Main {
         });
     }
 
-    private static String jsonText(
-            String data,
+    private void finishCall(Recognizer rec) {
+        appendVosk(rec.getFinalResult());
+
+        active = false;
+        finishing = false;
+        recording = false;
+
+        lastStopAt = System.nanoTime();
+
+        String draft = spoken.toString().trim();
+
+        Path finalWav = wavPath;
+        long length = 0;
+
+        if (wav != null) {
+            length = wav.length();
+
+            try {
+                wav.close();
+
+            } catch (IOException ignored) {
+            }
+
+            wav = null;
+        }
+
+        boolean wasTest = testCall;
+        long token = generation.get();
+
+        boolean wantWhisper =
+                useWhisper && length >= 6400;
+
+        ui(() -> {
+            status.setText(
+                    "Запись готова · ожидаю следующего звонка"
+            );
+
+            meter.setValue(0);
+            preview.setText(" ");
+
+            asrInfo.setText(
+                    wantWhisper
+                            ? "Whisper: уточняю русский и английский..."
+                            : "Vosk: итоговая расшифровка"
+            );
+        });
+
+        speechWorker.submit(() -> {
+            String result = draft;
+            String error = "";
+
+            if (wantWhisper) {
+                try {
+                    result = callWhisper(finalWav);
+
+                } catch (Exception ex) {
+                    error = ex.getMessage();
+                    result = draft;
+                }
+            }
+
+            final String finalText = result;
+            final String issue = error;
+
+            try {
+                Files.createDirectories(HISTORY);
+
+                Files.writeString(
+                        HISTORY.resolve(
+                                finalWav.getFileName()
+                                        .toString()
+                                        .replace(".wav", ".txt")
+                        ),
+                        "Vosk:\n" + draft +
+                                "\n\nИтог:\n" + finalText,
+                        StandardCharsets.UTF_8
+                );
+
+            } catch (IOException ignored) {
+            }
+
+            if (!enabled || generation.get() != token) {
+                return;
+            }
+
+            ui(() -> {
+                if (!enabled || generation.get() != token) {
+                    return;
+                }
+
+                lastText = finalText;
+
+                if (!finalText.isBlank()) {
+                    transcript.setText(
+                            "ИТОГ:\n" + finalText +
+                                    "\n\n---\nVosk (черновик):\n" +
+                                    draft
+                    );
+
+                    try {
+                        Toolkit.getDefaultToolkit()
+                                .getSystemClipboard()
+                                .setContents(
+                                        new StringSelection(finalText),
+                                        null
+                                );
+
+                    } catch (IllegalStateException ignored) {
+                    }
+
+                    if (autoSubmit && !wasTest) {
+                        queueBrowserJob(finalText);
+                    }
+                }
+
+                if (!issue.isBlank()) {
+                    asrInfo.setText(
+                            "Whisper недоступен, оставил Vosk: " +
+                                    issue
+                    );
+
+                } else {
+                    asrInfo.setText(
+                            wantWhisper
+                                    ? "Whisper: расшифровка готова"
+                                    : "Vosk: текст готов"
+                    );
+                }
+            });
+        });
+    }
+
+    private String callWhisper(
+            Path wavFile
+    ) throws Exception {
+        byte[] wavBytes =
+                Files.readAllBytes(wavFile);
+
+        HttpRequest request = HttpRequest.newBuilder(
+                        URI.create(
+                                "http://127.0.0.1:" +
+                                        WHISPER_PORT +
+                                        "/transcribe"
+                        )
+                )
+                .header(
+                        "Content-Type",
+                        "audio/wav"
+                )
+                .timeout(Duration.ofMinutes(8))
+                .POST(
+                        HttpRequest.BodyPublishers
+                                .ofByteArray(wavBytes)
+                )
+                .build();
+
+        HttpResponse<String> response = http.send(
+                request,
+                HttpResponse.BodyHandlers
+                        .ofString(StandardCharsets.UTF_8)
+        );
+
+        if (response.statusCode() != 200) {
+            throw new IOException(
+                    "HTTP " +
+                            response.statusCode() +
+                            ": " + response.body()
+            );
+        }
+
+        String result = field(
+                response.body(),
+                "text"
+        );
+
+        if (result.isBlank()) {
+            throw new IOException(
+                    "модель вернула пустой текст"
+            );
+        }
+
+        return result;
+    }
+
+    private static String field(
+            String json,
             String key
     ) {
         try {
-            return JSON.readTree(data)
+            return JSON.readTree(json)
                     .path(key)
                     .asText("")
                     .trim();
@@ -1526,92 +1834,103 @@ public class Main {
         }
     }
 
-    private static AudioIn findCable()
+    private static Capture findCable()
             throws LineUnavailableException {
         AudioFormat[] formats = {
-                new AudioFormat(48000, 16, 2, true, false),
-                new AudioFormat(48000, 16, 1, true, false),
-                new AudioFormat(44100, 16, 2, true, false),
-                new AudioFormat(16000, 16, 1, true, false)
+                new AudioFormat(
+                        48000, 16, 2, true, false
+                ),
+                new AudioFormat(
+                        48000, 16, 1, true, false
+                ),
+                new AudioFormat(
+                        44100, 16, 2, true, false
+                ),
+                new AudioFormat(
+                        16000, 16, 1, true, false
+                )
         };
 
-        for (Mixer.Info mixer : AudioSystem.getMixerInfo()) {
-            String name = mixer.getName()
+        for (Mixer.Info m :
+                AudioSystem.getMixerInfo()) {
+
+            String n = m.getName()
                     .toLowerCase(Locale.ROOT);
 
-            if (
-                    !name.contains("cable output") &&
-                            !name.contains("vb-audio virtual cable")
-            ) {
+            if (!(
+                    n.contains("cable output") ||
+                            n.contains("vb-audio virtual cable")
+            )) {
                 continue;
             }
 
-            for (AudioFormat format : formats) {
+            for (AudioFormat f : formats) {
                 try {
                     TargetDataLine line =
                             AudioSystem.getTargetDataLine(
-                                    format, mixer
+                                    f,
+                                    m
                             );
 
-                    line.open(format, 16384);
+                    line.open(f, 16384);
 
-                    return new AudioIn(
+                    return new Capture(
                             line,
-                            format,
-                            mixer.getName()
+                            f,
+                            m.getName()
                     );
 
-                } catch (Exception ignored) {}
+                } catch (Exception ignored) {
+                }
             }
         }
 
         throw new LineUnavailableException(
-                "Не найден CABLE Output в устройствах записи Windows"
+                "CABLE Output не найден в устройствах записи"
         );
     }
 
     private static int audioLevel(
-            byte[] data,
-            int count,
-            int channels
+            byte[] src,
+            int length
     ) {
-        double energy = 0;
-        int frames = 0;
+        double sum = 0;
+        int samples = 0;
 
-        for (
-                int i = 0;
-                i + channels * 2 <= count;
-                i += channels * 2
-        ) {
-            int sample = (short) (
-                    (data[i] & 255) |
-                            (data[i + 1] << 8)
+        for (int i = 0; i + 1 < length; i += 2) {
+            short s = (short) (
+                    (src[i] & 255) |
+                            (src[i + 1] << 8)
             );
 
-            energy += (double) sample * sample;
-            frames++;
+            sum += (double) s * s;
+            samples++;
         }
 
         return Math.min(
                 100,
                 (int) (
                         Math.sqrt(
-                                energy / Math.max(frames, 1)
+                                sum / Math.max(1, samples)
                         ) / 110
                 )
         );
     }
 
-    private static class Resampler {
+    private static class Downsampler {
+
         private final int channels;
         private final double ratio;
 
         private double remaining;
         private double sum;
 
-        Resampler(float rate, int channels) {
+        Downsampler(
+                float sourceRate,
+                int channels
+        ) {
             this.channels = channels;
-            this.ratio = rate / VOSK_HZ;
+            ratio = sourceRate / SAMPLE_RATE;
             reset();
         }
 
@@ -1621,57 +1940,58 @@ public class Main {
         }
 
         int convert(
-                byte[] input,
-                int length,
-                byte[] out
+                byte[] src,
+                int n,
+                byte[] dest
         ) {
-            int position = 0;
+            int pos = 0;
             int frame = channels * 2;
 
             for (
                     int i = 0;
-                    i + frame <= length;
+                    i + frame <= n;
                     i += frame
             ) {
                 double value = 0;
 
-                for (
-                        int channel = 0;
-                        channel < channels;
-                        channel++
-                ) {
-                    int j = i + channel * 2;
+                for (int c = 0; c < channels; c++) {
+                    int p = i + 2 * c;
 
                     value += (short) (
-                            (input[j] & 255) |
-                                    (input[j + 1] << 8)
+                            (src[p] & 255) |
+                                    (src[p + 1] << 8)
                     );
                 }
 
                 value /= channels;
 
-                double available = 1;
+                double amount = 1;
 
-                while (available > 1e-9) {
+                while (amount > 1e-9) {
                     double part = Math.min(
-                            available, remaining
+                            amount,
+                            remaining
                     );
 
                     sum += value * part;
+                    amount -= part;
                     remaining -= part;
-                    available -= part;
 
                     if (remaining < 1e-9) {
                         int sample = Math.max(
                                 -32768,
                                 Math.min(
                                         32767,
-                                        (int) Math.round(sum / ratio)
+                                        (int) Math.round(
+                                                sum / ratio
+                                        )
                                 )
                         );
 
-                        out[position++] = (byte) sample;
-                        out[position++] = (byte) (sample >>> 8);
+                        dest[pos++] = (byte) sample;
+
+                        dest[pos++] =
+                                (byte) (sample >>> 8);
 
                         remaining = ratio;
                         sum = 0;
@@ -1679,99 +1999,119 @@ public class Main {
                 }
             }
 
-            return position;
+            return pos;
         }
     }
 
-    private void setBridgeEnabled(boolean on) {
-        bridgeEnabled = on;
+    private static class WaveWriter
+            implements AutoCloseable {
 
-        bridgeToggle.setText(
-                on
-                        ? "ON · Телефон активен"
-                        : "OFF · Телефон отключён"
-        );
+        private final RandomAccessFile file;
+        private long bytes;
 
-        bridgeToggle.setBackground(
-                on
-                        ? new Color(31, 110, 82)
-                        : new Color(99, 44, 55)
-        );
-
-        phoneStatus.setText(
-                on
-                        ? "Готов · подними трубку"
-                        : "Мост выключен · OFF"
-        );
-
-        if (on) {
-            phoneEvents.clear();
-
-            chromeStatus.setText(
-                    "Мост включён · можно снимать трубку"
+        WaveWriter(Path path) throws IOException {
+            Files.createDirectories(
+                    path.getParent()
             );
 
-        } else {
-            phoneEvents.clear();
-            phoneEvents.offer("cancel");
-
-            browserJob = null;
-
-            pendingJob = -1;
-            pendingTab = -1;
-            pendingSince = 0;
-
-            chromeStatus.setText(
-                    "Автоотправка заблокирована. " +
-                            "Уже отправленный запрос не отозвать."
+            file = new RandomAccessFile(
+                    path.toFile(),
+                    "rw"
             );
+
+            file.setLength(0);
+            file.write(new byte[44]);
         }
-    }
 
-    private record OutputDevice(
-            String name,
-            Mixer.Info mixer
-    ) {
+        void write(
+                byte[] data,
+                int offset,
+                int n
+        ) throws IOException {
+            file.write(data, offset, n);
+            bytes += n;
+        }
+
+        long length() {
+            return bytes;
+        }
+
+        private void little32(long x)
+                throws IOException {
+            file.write((int) x & 255);
+            file.write((int) (x >> 8) & 255);
+            file.write((int) (x >> 16) & 255);
+            file.write((int) (x >> 24) & 255);
+        }
+
+        private void little16(int x)
+                throws IOException {
+            file.write(x & 255);
+            file.write((x >> 8) & 255);
+        }
+
         @Override
-        public String toString() {
-            return name;
+        public void close() throws IOException {
+            file.seek(0);
+
+            file.writeBytes("RIFF");
+            little32(36 + bytes);
+
+            file.writeBytes("WAVEfmt ");
+            little32(16);
+
+            little16(1);
+            little16(1);
+            little32(SAMPLE_RATE);
+
+            little32(SAMPLE_RATE * 2);
+            little16(2);
+            little16(16);
+
+            file.writeBytes("data");
+            little32(bytes);
+
+            file.close();
         }
     }
 
-    private List<OutputDevice> listOutputs() {
-        List<OutputDevice> result = new ArrayList<>();
+    private List<OutputDevice> outputs() {
+        List<OutputDevice> result =
+                new ArrayList<>();
 
         result.add(
                 new OutputDevice(
-                        "Системное устройство по умолчанию",
+                        "По умолчанию Windows",
                         null
                 )
         );
 
-        AudioFormat[] formats = {
-                new AudioFormat(44100, 16, 1, true, false),
-                new AudioFormat(48000, 16, 1, true, false),
-                new AudioFormat(48000, 16, 2, true, false)
-        };
+        AudioFormat probe = new AudioFormat(
+                44100,
+                16,
+                1,
+                true,
+                false
+        );
 
-        for (Mixer.Info info : AudioSystem.getMixerInfo()) {
-            Mixer mixer = AudioSystem.getMixer(info);
+        for (Mixer.Info i :
+                AudioSystem.getMixerInfo()) {
 
-            for (AudioFormat fmt : formats) {
-                if (
-                        mixer.isLineSupported(
-                                new DataLine.Info(
-                                        SourceDataLine.class,
-                                        fmt
-                                )
+            if (
+                    AudioSystem.getMixer(i)
+                            .isLineSupported(
+                                    new DataLine.Info(
+                                            SourceDataLine.class,
+                                            probe
+                                    )
+                            )
+            ) {
+                result.add(
+                        new OutputDevice(
+                                i.getName(),
+                                i
                         )
-                ) {
-                    result.add(
-                            new OutputDevice(info.getName(), info)
-                    );
-
-                    break;
-                }
+                );
             }
         }
 
@@ -1781,363 +2121,366 @@ public class Main {
     private void openSettings() {
         JDialog dialog = new JDialog(
                 frame,
-                "Настройки · Snom AI Bridge",
-                Dialog.ModalityType.APPLICATION_MODAL
+                "Настройки Snom AI Bridge",
+                true
         );
 
-        dialog.setSize(610, 370);
+        dialog.setSize(640, 365);
         dialog.setLocationRelativeTo(frame);
-        dialog.getContentPane().setBackground(BG);
-        dialog.setLayout(new BorderLayout(10, 12));
 
-        JPanel body = new JPanel(new GridBagLayout());
-        body.setBackground(CARD);
-
-        body.setBorder(
-                new EmptyBorder(16, 18, 16, 18)
+        JPanel root = new JPanel(
+                new GridBagLayout()
         );
 
-        GridBagConstraints c = new GridBagConstraints();
+        root.setBorder(
+                new EmptyBorder(16, 16, 16, 16)
+        );
+
+        GridBagConstraints c =
+                new GridBagConstraints();
+
+        c.insets =
+                new Insets(7, 4, 7, 7);
+
+        c.anchor =
+                GridBagConstraints.WEST;
 
         c.gridx = 0;
         c.gridy = 0;
-        c.insets = new Insets(9, 4, 9, 10);
-        c.anchor = GridBagConstraints.WEST;
 
-        body.add(
-                text("Устройство сигнала", 13, true, FG),
+        root.add(
+                new JLabel("Колонки для сигнала:"),
                 c
         );
 
-        JComboBox<OutputDevice> speakers =
+        JComboBox<OutputDevice> devices =
                 new JComboBox<>(
-                        listOutputs().toArray(
+                        outputs().toArray(
                                 new OutputDevice[0]
                         )
                 );
 
-        speakers.setFont(
-                new Font("Segoe UI", Font.PLAIN, 12)
-        );
-
-        for (int i = 0; i < speakers.getItemCount(); i++) {
-            OutputDevice item = speakers.getItemAt(i);
-
+        for (
+                int i = 0;
+                i < devices.getItemCount();
+                i++
+        ) {
             if (
-                    (
-                            signalMixerName.isEmpty() &&
-                                    item.mixer() == null
-                    ) ||
+                    devices.getItemAt(i)
+                            .name()
+                            .equals(speakerName) ||
                             (
-                                    item.mixer() != null &&
-                                            item.name().equals(signalMixerName)
+                                    speakerName.isBlank() &&
+                                            i == 0
                             )
             ) {
-                speakers.setSelectedIndex(i);
+                devices.setSelectedIndex(i);
                 break;
             }
         }
 
         c.gridx = 1;
         c.weightx = 1;
-        c.fill = GridBagConstraints.HORIZONTAL;
-        body.add(speakers, c);
+        c.fill =
+                GridBagConstraints.HORIZONTAL;
+
+        root.add(devices, c);
 
         c.gridx = 0;
         c.gridy++;
         c.weightx = 0;
         c.fill = GridBagConstraints.NONE;
 
-        body.add(
-                text("Громкость", 13, true, FG),
+        root.add(
+                new JLabel("Громкость уведомления:"),
                 c
         );
 
-        JSlider volume = new JSlider(
-                0, 100, signalVolume
+        JSlider volumeSlider = new JSlider(
+                0,
+                100,
+                volume
         );
-
-        volume.setBackground(CARD);
-        volume.setForeground(FG);
-
-        JLabel percent = text(
-                signalVolume + "%",
-                13, true, CYAN
-        );
-
-        volume.addChangeListener(
-                e -> percent.setText(
-                        volume.getValue() + "%"
-                )
-        );
-
-        JPanel sliderRow = transparent();
-        sliderRow.setLayout(new BorderLayout(10, 0));
-
-        sliderRow.add(volume, BorderLayout.CENTER);
-        sliderRow.add(percent, BorderLayout.EAST);
 
         c.gridx = 1;
         c.weightx = 1;
-        c.fill = GridBagConstraints.HORIZONTAL;
+        c.fill =
+                GridBagConstraints.HORIZONTAL;
 
-        body.add(sliderRow, c);
+        root.add(volumeSlider, c);
 
         c.gridx = 0;
         c.gridy++;
         c.weightx = 0;
         c.fill = GridBagConstraints.NONE;
 
-        body.add(
-                text("HTTP Snom (необязательно)", 13, true, FG),
+        root.add(
+                new JLabel("Уточнять речь через Whisper:"),
                 c
         );
 
-        JTextField user = new JTextField(snomHttpUser, 12);
+        JCheckBox whisper = new JCheckBox(
+                "Использовать GPU-модель после звонка",
+                useWhisper
+        );
+
+        c.gridx = 1;
+        root.add(whisper, c);
+
+        c.gridx = 0;
+        c.gridy++;
+
+        root.add(
+                new JLabel("HTTP пользователь Snom:"),
+                c
+        );
+
+        JTextField user = new JTextField(
+                snomUser,
+                15
+        );
+
+        c.gridx = 1;
+        c.fill =
+                GridBagConstraints.HORIZONTAL;
+
+        root.add(user, c);
+
+        c.gridx = 0;
+        c.gridy++;
+        c.fill = GridBagConstraints.NONE;
+
+        root.add(
+                new JLabel("HTTP пароль Snom:"),
+                c
+        );
+
         JPasswordField pass =
-                new JPasswordField(snomHttpPassword, 12);
-
-        JPanel credentials = transparent();
-        credentials.setLayout(new GridLayout(1, 2, 9, 0));
-
-        credentials.add(user);
-        credentials.add(pass);
+                new JPasswordField(
+                        snomPassword,
+                        15
+                );
 
         c.gridx = 1;
-        c.weightx = 1;
-        c.fill = GridBagConstraints.HORIZONTAL;
+        c.fill =
+                GridBagConstraints.HORIZONTAL;
 
-        body.add(credentials, c);
+        root.add(pass, c);
 
-        c.gridx = 0;
-        c.gridy++;
-        c.gridwidth = 2;
-        c.weightx = 1;
-
-        body.add(
-                text(
-                        "HTTP нужен только при запросе логина Snom для набора 101.",
-                        11, false, MUTE
-                ),
-                c
+        JPanel footer = new JPanel(
+                new FlowLayout(FlowLayout.RIGHT)
         );
 
-        dialog.add(body, BorderLayout.CENTER);
+        JButton check =
+                new JButton("Проверить звук");
 
-        JPanel footer = transparent();
+        check.addActionListener(e -> {
+            OutputDevice device =
+                    (OutputDevice) devices.getSelectedItem();
 
-        footer.setBorder(
-                new EmptyBorder(0, 18, 15, 18)
+            playSignalOn(
+                    device == null
+                            ? null
+                            : device.info(),
+                    volumeSlider.getValue()
+            );
+        });
+
+        JButton save =
+                new JButton("Сохранить");
+
+        save.addActionListener(e -> {
+            OutputDevice device =
+                    (OutputDevice) devices.getSelectedItem();
+
+            speakerName =
+                    device == null ||
+                            device.info() == null
+                            ? ""
+                            : device.name();
+
+            volume = volumeSlider.getValue();
+            useWhisper = whisper.isSelected();
+
+            snomUser = user.getText().trim();
+
+            snomPassword =
+                    new String(pass.getPassword());
+
+            prefs.put(
+                    "speaker",
+                    speakerName
+            );
+
+            prefs.putInt(
+                    "volume",
+                    volume
+            );
+
+            prefs.putBoolean(
+                    "useWhisper",
+                    useWhisper
+            );
+
+            dialog.dispose();
+        });
+
+        JButton cancel =
+                new JButton("Отмена");
+
+        cancel.addActionListener(e ->
+                dialog.dispose()
         );
 
-        footer.setLayout(
-                new FlowLayout(FlowLayout.RIGHT, 9, 0)
-        );
-
-        JButton previewButton = button(
-                "Проверить звук",
-                false,
-                () -> {
-                    OutputDevice dev =
-                            (OutputDevice) speakers.getSelectedItem();
-
-                    playSignalOn(
-                            dev == null ? null : dev.mixer(),
-                            volume.getValue()
-                    );
-                }
-        );
-
-        footer.add(previewButton);
-
-        JButton cancel = button(
-                "Отмена",
-                false,
-                dialog::dispose
-        );
-
+        footer.add(check);
         footer.add(cancel);
-
-        JButton save = button(
-                "Сохранить",
-                true,
-                () -> {
-                    OutputDevice dev =
-                            (OutputDevice) speakers.getSelectedItem();
-
-                    signalMixerName =
-                            dev == null || dev.mixer() == null
-                                    ? ""
-                                    : dev.name();
-
-                    signalVolume = volume.getValue();
-
-                    prefs.put("signal_mixer", signalMixerName);
-                    prefs.putInt("signal_volume", signalVolume);
-
-                    snomHttpUser = user.getText().trim();
-
-                    snomHttpPassword =
-                            new String(pass.getPassword());
-
-                    dialog.dispose();
-                }
-        );
-
         footer.add(save);
 
+        dialog.setLayout(new BorderLayout());
+        dialog.add(root);
         dialog.add(footer, BorderLayout.SOUTH);
+
         dialog.setVisible(true);
     }
 
     private void playSignal() {
         Mixer.Info chosen = null;
-        String name = signalMixerName;
 
-        if (!name.isEmpty()) {
-            for (Mixer.Info info : AudioSystem.getMixerInfo()) {
-                if (info.getName().equals(name)) {
+        if (!speakerName.isBlank()) {
+            for (Mixer.Info info :
+                    AudioSystem.getMixerInfo()) {
+
+                if (
+                        info.getName()
+                                .equals(speakerName)
+                ) {
                     chosen = info;
-                    break;
                 }
+            }
+
+            if (chosen == null) {
+                chromeInfo.setText(
+                        "Колонки не найдены: " + speakerName
+                );
+                return;
             }
         }
 
-        if (!name.isEmpty() && chosen == null) {
-            chromeStatus.setText(
-                    "Сохранённое устройство сигнала не найдено · открой Настройки"
-            );
-
-            return;
-        }
-
-        playSignalOn(chosen, signalVolume);
+        playSignalOn(chosen, volume);
     }
 
     private void playSignalOn(
             Mixer.Info mixer,
-            int volume
+            int level
     ) {
         daemon(() -> {
-            AudioFormat[] formats = {
-                    new AudioFormat(44100, 16, 1, true, false),
-                    new AudioFormat(48000, 16, 1, true, false),
-                    new AudioFormat(48000, 16, 2, true, false)
-            };
+            AudioFormat format = new AudioFormat(
+                    44100,
+                    16,
+                    1,
+                    true,
+                    false
+            );
 
-            Exception failure = null;
+            try (
+                    SourceDataLine output =
+                            mixer == null
+                                    ? AudioSystem.getSourceDataLine(
+                                    format
+                            )
+                                    : AudioSystem.getSourceDataLine(
+                                    format,
+                                    mixer
+                            )
+            ) {
+                output.open(format);
+                output.start();
 
-            for (AudioFormat format : formats) {
-                try (
-                        SourceDataLine line =
-                                mixer == null
-                                        ? AudioSystem.getSourceDataLine(
-                                        format
+                int rate = 44100;
+
+                for (int tone = 0; tone < 2; tone++) {
+                    int count = tone == 0
+                            ? 7000
+                            : 9500;
+
+                    byte[] bytes = new byte[
+                            count * 2
+                            ];
+
+                    for (int i = 0; i < count; i++) {
+                        double fade = Math.min(
+                                1,
+                                Math.min(
+                                        i / 400.0,
+                                        (count - i) / 400.0
                                 )
-                                        : AudioSystem.getSourceDataLine(
-                                        format,
-                                        mixer
-                                )
-                ) {
-                    line.open(format);
-                    line.start();
+                        );
 
-                    int rate = (int) format.getSampleRate();
-                    int channels = format.getChannels();
+                        short sample = (short) (
+                                Math.sin(
+                                        2 * Math.PI *
+                                                (
+                                                        tone == 0
+                                                                ? 720
+                                                                : 980
+                                                ) *
+                                                i / rate
+                                ) *
+                                        24000 *
+                                        fade *
+                                        level / 100.0
+                        );
 
-                    for (int tone = 0; tone < 2; tone++) {
-                        int frames =
-                                rate * (
-                                        tone == 0 ? 170 : 220
-                                ) / 1000;
+                        bytes[i * 2] =
+                                (byte) sample;
 
-                        byte[] pcm =
-                                new byte[frames * channels * 2];
-
-                        double frequency =
-                                tone == 0 ? 740 : 980;
-
-                        for (int i = 0; i < frames; i++) {
-                            double envelope = Math.min(
-                                    1.0,
-                                    Math.min(
-                                            i / (rate * 0.012),
-                                            (frames - 1 - i) /
-                                                    (rate * 0.015)
-                                    )
-                            );
-
-                            short sample = (short) (
-                                    Math.sin(
-                                            2 * Math.PI *
-                                                    frequency * i / rate
-                                    ) *
-                                            envelope *
-                                            0.25 *
-                                            32767 *
-                                            volume / 100.0
-                            );
-
-                            for (int ch = 0; ch < channels; ch++) {
-                                int pos =
-                                        (i * channels + ch) * 2;
-
-                                pcm[pos] = (byte) sample;
-                                pcm[pos + 1] =
-                                        (byte) (sample >>> 8);
-                            }
-                        }
-
-                        line.write(pcm, 0, pcm.length);
-
-                        if (tone == 0) {
-                            byte[] silence =
-                                    new byte[
-                                            rate * channels * 2 / 12
-                                            ];
-
-                            line.write(
-                                    silence,
-                                    0,
-                                    silence.length
-                            );
-                        }
+                        bytes[i * 2 + 1] =
+                                (byte) (sample >> 8);
                     }
 
-                    line.drain();
-                    return;
-
-                } catch (Exception ex) {
-                    failure = ex;
+                    output.write(
+                            bytes,
+                            0,
+                            bytes.length
+                    );
                 }
+
+                output.drain();
+
+            } catch (Exception ex) {
+                ui(() -> chromeInfo.setText(
+                        "Ошибка звука: " + ex.getMessage()
+                ));
             }
-
-            final String message =
-                    failure == null
-                            ? "неизвестная ошибка"
-                            : failure.getMessage();
-
-            ui(() -> chromeStatus.setText(
-                    "Не удалось проиграть сигнал: " + message
-            ));
-
-        }, "signal-player").start();
+        }, "audio-alert").start();
     }
 
     private void shutdown() {
         closing = true;
 
-        if (swingTimer != null) swingTimer.stop();
-        if (browserServer != null) browserServer.stop(0);
-        if (snomServer != null) snomServer.stop(0);
-        if (sipSocket != null) sipSocket.close();
-        if (inputLine != null) inputLine.close();
+        if (uiTimer != null) {
+            uiTimer.stop();
+        }
 
-        dialExecutor.shutdownNow();
+        if (phoneServer != null) {
+            phoneServer.stop(0);
+        }
+
+        if (chromeServer != null) {
+            chromeServer.stop(0);
+        }
+
+        if (sipSocket != null) {
+            sipSocket.close();
+        }
+
+        if (inputLine != null) {
+            inputLine.close();
+        }
+
+        dialWorker.shutdownNow();
+        speechWorker.shutdownNow();
+
         frame.dispose();
-    }
-
-    private static void ui(Runnable task) {
-        SwingUtilities.invokeLater(task);
     }
 }
